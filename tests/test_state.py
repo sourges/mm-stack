@@ -55,8 +55,10 @@ class TestKraken(unittest.TestCase):
                self.ev(self.k.message("snapshot", bids=[("100.3", "1.0")], asks=[("100.5", "2.0")]))]
         sm, out = run(evs)
         self.assertIn("CHECKSUM MISMATCH", out[1])
-        self.assertEqual(len(out), 3)  # nothing printed for the skipped update
-        self.assertIn("bid=100.3", out[2])
+        self.assertIn("ACTION reconnect conn=kraken", out[2])  # step 4: ask for a fresh book
+        self.assertEqual(len(out), 4)  # nothing printed for the skipped update
+        self.assertIn("bid=100.3", out[3])
+        self.assertEqual(sm.take_actions()[0]["action"], "reconnect")
         self.assertEqual(sm.stats["kraken.checksum_bad"], 1)
         self.assertEqual(sm.stats["kraken.updates_skipped_invalid_book"], 1)
 
@@ -100,7 +102,8 @@ class TestCoinbase(unittest.TestCase):
                self.ev(2, coinbase_heartbeat(2)),
                self.ev(3, coinbase_l2(4, "update", "BTC-USD", [("bid", "10.5", "1")]))]
         sm, out = run(evs)
-        self.assertIn("SEQ GAP 2 -> 4", out[-1])
+        self.assertIn("SEQ GAP 2 -> 4", out[-2])
+        self.assertIn("ACTION reconnect conn=coinbase", out[-1])
         self.assertFalse(sm.valid[("coinbase", "BTC-USD")])
         self.assertEqual(sm.stats["coinbase.seq_gaps"], 1)
 

@@ -102,3 +102,28 @@ def sample_session():
     add("coinbase", "ws_in", {"text": coinbase_l2(5, "update", "BTC-USD", [("bid", "45280.50", "1")])})  # gap 3->5
     add("coinbase", "conn_close", {"reason": "eof from server"})
     return evs
+
+
+# ---------- private feed (our orders) ----------
+INSTRUMENT_BTC = ('{"channel":"instrument","type":"snapshot","data":{"assets":[],"pairs":['
+                  '{"symbol":"BTC/USD","base":"BTC","quote":"USD","status":"online",'
+                  '"qty_precision":8,"qty_increment":0.00000001,"price_precision":1,'
+                  '"price_increment":0.1,"qty_min":0.00005,"cost_min":0.5}]}}')
+
+
+def executions(type_, orders):
+    """orders: list of dicts with cl_ord_id, exec_type, order_status (+ optional reason)."""
+    data = [dict({"order_id": f"O{i}", "symbol": "BTC/USD", "side": "buy",
+                  "order_type": "limit", "timestamp": "2026-11-13T17:00:00Z"}, **o)
+            for i, o in enumerate(orders)]
+    return json.dumps({"channel": "executions", "type": type_, "data": data, "sequence": 1})
+
+
+def ack(method, success=True, error=None, req_id=1):
+    msg = {"method": method, "req_id": req_id, "success": success,
+           "time_in": "2026-11-13T17:00:00Z", "time_out": "2026-11-13T17:00:00Z"}
+    if success:
+        msg["result"] = {"order_id": "O1"}
+    else:
+        msg["error"] = error
+    return json.dumps(msg)

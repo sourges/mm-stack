@@ -13,6 +13,8 @@ Logging rules (from the guide):
 
 import base64
 import errno
+import json
+import queue
 import selectors
 import socket
 import ssl
@@ -43,7 +45,7 @@ RECONNECT_DELAY = 5.0
 class WsClient:
     """One WebSocket connection.
 
-    States: idle -> connecting -> tls -> ws_handshake -> open -> closed
+    States: idle -> starting -> connecting -> tls -> ws_handshake -> open -> closed
     After closing it reconnects by itself after reconnect_delay seconds
     (unless the reactor is shutting down).
     """
@@ -90,8 +92,11 @@ class WsClient:
         self._started_at = now
         self._last_data_at = now
         self._reconnect_at = None
+        self.state = "starting"  # so close() works if setup fails (state may be "closed")
         self.log("conn_open", {"host": self.host, "port": self.port,
                                "path": self.path, "tls": self.use_tls})
+        if not self.before_connect(now):
+            return
         try:
             family, type_, proto, _, addr = socket.getaddrinfo(
                 self.host, self.port, type=socket.SOCK_STREAM)[0]
@@ -149,7 +154,7 @@ class WsClient:
         """Timers: reconnect, connect timeout, idle timeout."""
         if self.state == "closed" and self._reconnect_at is not None and now >= self._reconnect_at:
             self.start(self.selector, now)
-        elif self.state in ("connecting", "tls", "ws_handshake"):
+        elif self.state in ("starting", "connecting", "tls", "ws_handshake"):
             if now - self._started_at > self.connect_timeout:
                 self.close(now, "connect timeout")
         elif self.state == "open":
@@ -265,8 +270,7 @@ class WsClient:
                                      "extensions": [str(x) for x in ev.extensions]})
                 self.state = "open"
                 self.log("ws_open")
-                for text in self.subscribe:
-                    self.send_text(text)
+                self.on_open(now)
             elif isinstance(ev, RejectConnection):
                 self.log("http_in", {"status": ev.status_code,
                                      "headers": [[k.decode("latin-1"), v.decode("latin-1")]
@@ -308,10 +312,37 @@ class WsClient:
                 return
         self._flush(now)
 
-    def send_text(self, text):
-        """Log, THEN send a text message."""
-        self.log("ws_out", {"text": text})
+    def send_text(self, text, log_text=None):
+        """Log, THEN send a text message. log_text replaces the text in the
+        log (used to hide tokens)."""
+        self.log("ws_out", {"text": text if log_text is None else log_text})
         self._send_raw(self._ws.send(TextMessage(data=text)))
+
+    # ---------- hooks for subclasses ----------
+    def before_connect(self, now):
+        """Return False to abort this connect attempt (after logging why)."""
+        return True
+
+    def on_open(self, now):
+        for text in self.subscribe:
+            self.send_text(text)
+
+    def handle_action(self, action, now):
+        """An action from the state machine addressed to this connection."""
+        if action.get("action") == "reconnect":
+            if self.state != "closed":
+                self.close(now, "reconnect requested by state machine")
+            self._reconnect_at = now  # reconnect on the next tick
+        else:
+            self.log("action_rejected", {"id": action.get("id"),
+                                         "reason": f"{self.name} can't do {action.get('action')}"})
+
+    def prepare_shutdown(self, now):
+        """Called once before shutdown; send anything that must go out (e.g. cancels)."""
+
+    def wants_more_time(self):
+        """During shutdown: True while we still have bytes to send."""
+        return self.sock is not None and bool(self._outbuf)
 
     # ---------- raw socket output ----------
     def _send_raw(self, data):
@@ -344,37 +375,92 @@ class WsClient:
 
 
 class Reactor:
-    """Runs every WsClient on one thread with one selector."""
+    """Runs every WsClient on one thread with one selector.
+
+    Other threads hand actions in with submit(); a socketpair wakes the
+    selector so actions go out right away instead of on the next timeout.
+    """
+
+    SHUTDOWN_GRACE = 1.5  # seconds to let final messages (cancels) go out
 
     def __init__(self, clients, clock=time.monotonic, poll_timeout=0.1):
         self.clients = clients
+        self._by_name = {c.name: c for c in clients}
         self._clock = clock
         self.poll_timeout = poll_timeout
         self.selector = selectors.DefaultSelector()
+        self._actions = queue.Queue()
+        self._wake_r, self._wake_w = socket.socketpair()
+        self._wake_r.setblocking(False)
+        self._wake_w.setblocking(False)
+
+    def submit(self, action):
+        """Thread-safe: queue an action for its connection and wake the loop."""
+        self._actions.put(action)
+        try:
+            self._wake_w.send(b"x")
+        except (BlockingIOError, OSError):
+            pass  # already has a wake byte pending, or shutting down
+
+    def _drain_actions(self, now):
+        try:
+            while True:
+                self._wake_r.recv(4096)
+        except (BlockingIOError, InterruptedError, OSError):
+            pass
+        while True:
+            try:
+                action = self._actions.get_nowait()
+            except queue.Empty:
+                return
+            client = self._by_name.get(action.get("conn"))
+            if client is None:
+                # Log it on the first client so the state machine sees it.
+                self.clients[0].log("action_rejected", {"id": action.get("id"),
+                                                        "reason": f"unknown conn {action.get('conn')}"})
+                continue
+            client.handle_action(action, now)
+            client._flush(now)  # send now; don't wait for the next socket event
+
+    def _poll_once(self, timeout):
+        ready = self.selector.select(timeout)
+        now = self._clock()
+        for key, mask in ready:
+            if key.data is None:  # the wake socket
+                self._drain_actions(now)
+                continue
+            client = key.data
+            if mask & selectors.EVENT_READ and client.sock is not None:
+                client.on_readable(now)
+            if mask & selectors.EVENT_WRITE and client.sock is not None:
+                client.on_writable(now)
+        self._drain_actions(now)
+        return now
 
     def run(self, stop_event):
+        self.selector.register(self._wake_r, selectors.EVENT_READ, None)
         now = self._clock()
         for c in self.clients:
             c.start(self.selector, now)
         try:
             while not stop_event.is_set():
-                if self.selector.get_map():
-                    ready = self.selector.select(self.poll_timeout)
-                else:
-                    # Windows select() errors with no sockets registered.
-                    time.sleep(self.poll_timeout)
-                    ready = []
-                now = self._clock()
-                for key, mask in ready:
-                    client = key.data
-                    if mask & selectors.EVENT_READ and client.sock is not None:
-                        client.on_readable(now)
-                    if mask & selectors.EVENT_WRITE and client.sock is not None:
-                        client.on_writable(now)
+                now = self._poll_once(self.poll_timeout)
                 for c in self.clients:
                     c.tick(now)
         finally:
             now = self._clock()
             for c in self.clients:
+                try:
+                    c.prepare_shutdown(now)
+                    c._flush(now)
+                except Exception as e:  # never let this block the closes below
+                    c.log("shutdown_error", {"error": repr(e)})
+            deadline = now + self.SHUTDOWN_GRACE
+            while self._clock() < deadline and any(c.wants_more_time() for c in self.clients):
+                self._poll_once(0.05)
+            now = self._clock()
+            for c in self.clients:
                 c.close(now, "shutdown", reconnect=False)
             self.selector.close()
+            self._wake_r.close()
+            self._wake_w.close()

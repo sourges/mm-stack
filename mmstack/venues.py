@@ -6,7 +6,7 @@ KRAKEN_BOOK_DEPTH = 10  # Kraken's checksum covers the top 10 levels
 
 
 def kraken(symbols):
-    """Kraken spot WebSocket v2: order book (depth 10) + trades."""
+    """Kraken spot WebSocket v2: order book (depth 10), trades, instrument info."""
     subs = [
         {"method": "subscribe",
          "params": {"channel": "book", "symbol": symbols, "depth": KRAKEN_BOOK_DEPTH},
@@ -14,6 +14,10 @@ def kraken(symbols):
         {"method": "subscribe",
          "params": {"channel": "trade", "symbol": symbols},
          "req_id": 2},
+        # Sizes and price ticks for every pair (min order size, price increment).
+        {"method": "subscribe",
+         "params": {"channel": "instrument"},
+         "req_id": 3},
     ]
     return {
         "name": "kraken",

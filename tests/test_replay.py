@@ -89,5 +89,27 @@ class TestReplay(unittest.TestCase):
             self.assertEqual(f.read().splitlines(), replay_lines(self.path))
 
 
+
+
+class TestActionSink(unittest.TestCase):
+    def test_logs_before_sending(self):
+        from mmstack.main import action_sink
+        calls = []
+
+        class W:
+            def write(self, conn, type_, data):
+                calls.append(("log", conn, type_, data["id"]))
+
+        class R:
+            def submit(self, action):
+                calls.append(("send", action["id"]))
+
+        sink = action_sink(W(), R())
+        sink({"id": 1, "action": "reconnect", "conn": "kraken"})
+        sink({"id": 2, "action": "reconnect", "conn": "coinbase"})
+        self.assertEqual(calls, [("log", "sm", "action", 1), ("send", 1),
+                                 ("log", "sm", "action", 2), ("send", 2)])
+
+
 if __name__ == "__main__":
     unittest.main()
