@@ -377,14 +377,23 @@ class WsClient:
 class Reactor:
     """Runs every WsClient on one thread with one selector.
 
-    Other threads hand actions in with submit(); a socketpair wakes the
-    selector so actions go out right away instead of on the next timeout.
+    One non-blocking loop polls three things: the sockets, the action queue
+    and the timer.
+      - Other threads hand actions in with submit(); a socketpair wakes the
+        selector so actions go out right away instead of on the next timeout.
+      - Every timer_interval seconds it logs a "timer" event, so the state
+        machine gets a chance to act even when no market data arrives.
     """
 
     SHUTDOWN_GRACE = 1.5  # seconds to let final messages (cancels) go out
 
-    def __init__(self, clients, clock=time.monotonic, poll_timeout=0.1):
+    def __init__(self, clients, clock=time.monotonic, poll_timeout=0.1,
+                 timer_log=None, timer_interval=1.0):
         self.clients = clients
+        self._timer_log = timer_log  # EventWriter.write, or None for no timer
+        self.timer_interval = timer_interval
+        self._next_timer = None
+        self._timer_n = 0
         self._by_name = {c.name: c for c in clients}
         self._clock = clock
         self.poll_timeout = poll_timeout
@@ -415,15 +424,35 @@ class Reactor:
                 return
             client = self._by_name.get(action.get("conn"))
             if client is None:
-                # Log it on the first client so the state machine sees it.
-                self.clients[0].log("action_rejected", {"id": action.get("id"),
-                                                        "reason": f"unknown conn {action.get('conn')}"})
+                reason = f"unknown conn {action.get('conn')}"
+                if self.clients:
+                    self.clients[0].log("action_rejected", {"id": action.get("id"), "reason": reason})
+                elif self._timer_log:
+                    self._timer_log("net", "action_rejected", {"id": action.get("id"), "reason": reason})
                 continue
             client.handle_action(action, now)
             client._flush(now)  # send now; don't wait for the next socket event
 
+    def _fire_timer(self, now):
+        """Log a timer event if one is due. Late ticks are not replayed one by
+        one: we log one event and say how late it was."""
+        if self._timer_log is None or now < self._next_timer:
+            return
+        late = now - self._next_timer
+        self._timer_n += 1
+        self._timer_log("timer", "timer", {"n": self._timer_n, "late_ms": round(late * 1000, 1)})
+        self._next_timer += self.timer_interval
+        if self._next_timer <= now:  # fell behind by more than one tick: skip ahead
+            missed = int((now - self._next_timer) // self.timer_interval) + 1
+            self._next_timer += missed * self.timer_interval
+
+    def _select_timeout(self, wanted):
+        if self._timer_log is None:
+            return wanted
+        return max(0.0, min(wanted, self._next_timer - self._clock()))
+
     def _poll_once(self, timeout):
-        ready = self.selector.select(timeout)
+        ready = self.selector.select(self._select_timeout(timeout))
         now = self._clock()
         for key, mask in ready:
             if key.data is None:  # the wake socket
@@ -435,11 +464,13 @@ class Reactor:
             if mask & selectors.EVENT_WRITE and client.sock is not None:
                 client.on_writable(now)
         self._drain_actions(now)
+        self._fire_timer(now)
         return now
 
     def run(self, stop_event):
         self.selector.register(self._wake_r, selectors.EVENT_READ, None)
         now = self._clock()
+        self._next_timer = now + self.timer_interval
         for c in self.clients:
             c.start(self.selector, now)
         try:
@@ -448,6 +479,7 @@ class Reactor:
                 for c in self.clients:
                     c.tick(now)
         finally:
+            self._timer_log = None  # no more ticks while shutting down
             now = self._clock()
             for c in self.clients:
                 try:

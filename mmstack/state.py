@@ -156,7 +156,10 @@ class StateMachine:
             self._check_logged_action(event["data"], out)
         elif type_ == "action_rejected":
             self._action_rejected(event["data"], out)
+        elif type_ == "timer":
+            pass  # nothing to update: it exists so the steps below run even in a quiet market
 
+        # Time-based decisions run after EVERY event, timer ticks included.
         self._test_order_step(out)
         return out
 

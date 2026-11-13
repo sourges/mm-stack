@@ -1,7 +1,7 @@
 # mm-stack
 
 A small market-making trading stack, built step by step from the "minimal HFT
-stack" guide. **Steps 1–5 are done:**
+stack" guide. **Steps 1–7 are done** (8–9 are Linux speed work, saved for later):
 
 1. Record everything that happens on the network (Kraken + Coinbase public
    feeds) to an append-only log file, with local timestamps.
@@ -12,6 +12,8 @@ stack" guide. **Steps 1–5 are done:**
 
 4. The state machine can **act**: reconnect a feed whose book went bad, place
    and cancel orders. Every action is written to the log first, then sent.
+   A **1-second timer** event is logged too (step 7), so time-based decisions
+   (like the test order's 5-second cancel) happen even in a quiet market.
 5. One **test order** on Kraken: a tiny post-only buy 5% under the bid,
    cancelled 5 seconds after Kraken confirms it. Replay must make exactly the
    same decisions.
@@ -166,6 +168,6 @@ One JSON object per line:
 
 Types: `conn_open`, `tcp_connected`, `tls_ok`, `http_out`, `http_in`, `ws_open`,
 `ws_out`, `ws_in`, `ws_ping_in`, `ws_pong_out`, `ws_close_in`, `ws_close_out`,
-`conn_close`, plus `session` (settings), `action` (logged by the state
+`conn_close`, plus `timer` (every second: `{"n": 12, "late_ms": 0.4}`), `session` (settings), `action` (logged by the state
 machine before sending), `action_rejected` (refused by the network layer).
 Logs go in `data/` by default (git-ignored).

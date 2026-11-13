@@ -78,6 +78,11 @@ def consume(tailer, sm, out, follow, should_stop=lambda: False, poll=POLL_SECOND
             time.sleep(poll)
 
 
+def build_reactor(clients, writer):
+    """Network loop for live mode, with the step 7 timer: a logged tick every second."""
+    return Reactor(clients, timer_log=writer.write, timer_interval=1.0)
+
+
 def action_sink(writer, reactor):
     """Live: every action is logged FIRST, then handed to the network thread."""
     def log_then_send(action):
@@ -120,7 +125,7 @@ def run_live(args):
                                      "private": private, "trading_enabled": args.enable_trading})
     clients = build_clients(writer, _split(args.kraken), _split(args.coinbase), keys=keys,
                             private=private, trading_enabled=args.enable_trading)
-    reactor = Reactor(clients)
+    reactor = build_reactor(clients, writer)
     net_stop = threading.Event()
 
     def net_main():
