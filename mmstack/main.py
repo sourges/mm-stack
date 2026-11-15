@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+from decimal import Decimal
 
 from . import venues
 from .eventlog import CompressError, EventTailer, EventWriter, compress_log
@@ -122,7 +123,8 @@ def run_live(args):
     writer = EventWriter(log_path)
     # Settings that change decisions go in the log, so replay uses the same ones.
     writer.write("main", "session", {"test_order": args.test_order,
-                                     "private": private, "trading_enabled": args.enable_trading})
+                                     "private": private, "trading_enabled": args.enable_trading,
+                                     "paper_mm": paper_config(args)})
     clients = build_clients(writer, _split(args.kraken), _split(args.coinbase), keys=keys,
                             private=private, trading_enabled=args.enable_trading)
     reactor = build_reactor(clients, writer)
@@ -166,7 +168,8 @@ def run_live(args):
 def run_replay(args):
     tailer = EventTailer(args.log)
     sm = StateMachine(test_order_symbol=args.test_order,
-                      pretend_private_ready=args.pretend_private)
+                      pretend_private_ready=args.pretend_private,
+                      paper_mm=paper_config(args))
     out = Output(args.out)
     consume(tailer, sm, out, follow=False)
     for line in sm.summary():
@@ -218,6 +221,30 @@ def run_compress(args):
         sys.exit(1)
 
 
+def paper_config(args):
+    """Step 10 paper market maker settings from the command line (or None)."""
+    if not getattr(args, "paper_mm", None):
+        return None
+    return {"symbols": _split(args.paper_mm),
+            "spread": str(Decimal(args.mm_spread) / 100),  # 0.05 (%) -> "0.0005"
+            "max_inv": args.mm_max_inv,
+            "requote": args.mm_requote,
+            "latency_ms": args.mm_latency_ms}
+
+
+def add_paper_args(p):
+    p.add_argument("--paper-mm", nargs="?", const="BTC/USD,LINK/USD", metavar="SYMBOLS",
+                   help="step 10: paper market maker (default symbols BTC/USD,LINK/USD)")
+    p.add_argument("--mm-spread", default="0.05",
+                   help="distance of each quote from mid, in %% (default 0.05)")
+    p.add_argument("--mm-max-inv", type=int, default=5,
+                   help="max inventory, in order sizes (default 5)")
+    p.add_argument("--mm-requote", default="0.1",
+                   help="re-quote only when the price moves this fraction of the distance (default 0.1)")
+    p.add_argument("--mm-latency-ms", type=int, default=150,
+                   help="simulated time before a new quote is live (default 150)")
+
+
 def _split(text):
     return [s.strip() for s in text.split(",") if s.strip()] if text else []
 
@@ -238,6 +265,7 @@ def main(argv=None):
                       help="allow the network layer to send orders (implies --private)")
     live.add_argument("--test-order", metavar="SYMBOL",
                       help="step 5: place one tiny post-only buy 5%% under the bid, then cancel it")
+    add_paper_args(live)
     live.set_defaults(func=run_live)
 
     rep = sub.add_parser("replay", help="run the state machine over a recorded log")
@@ -247,6 +275,7 @@ def main(argv=None):
                      help="dry run: turn on the test order for an old log")
     rep.add_argument("--pretend-private", action="store_true",
                      help="dry run: act as if the private feed were ready")
+    add_paper_args(rep)
     rep.set_defaults(func=run_replay)
 
     comp = sub.add_parser("compress", help="gzip finished logs (file or folder)")

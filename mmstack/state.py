@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from .books import Book, kraken_checksum
+from .paper_mm import PaperMarketMaker
 from .venues import KRAKEN_BOOK_DEPTH
 
 TEST_ORDER_DISCOUNT = Decimal("0.05")  # test buy sits 5% below the best bid
@@ -39,7 +40,7 @@ def round_to(value, increment, rounding):
 
 
 class StateMachine:
-    def __init__(self, test_order_symbol=None, pretend_private_ready=False):
+    def __init__(self, test_order_symbol=None, pretend_private_ready=False, paper_mm=None):
         self.now = None  # ns, from the last event
         self.first_t = None  # ns of the first event; used to build order ids
         self.conns = {}  # conn name -> "connecting" / "open" / "closed"
@@ -63,6 +64,26 @@ class StateMachine:
         self.test_symbol = test_order_symbol
         self.test_phase = "off" if test_order_symbol is None else "waiting"
         self.test_cl_ord_id = None
+
+        # step 10 (paper): {"symbols": [...], "spread": "0.0005", ...} or None
+        self.paper_config = None
+        self.paper = {}  # symbol -> PaperMarketMaker
+        if paper_mm:
+            self._enable_paper(paper_mm)
+
+    def _enable_paper(self, cfg):
+        self.paper_config = cfg
+        for sym in cfg["symbols"]:
+            mm = PaperMarketMaker(sym, spread=Decimal(cfg["spread"]),
+                                  max_inv_multiple=Decimal(str(cfg.get("max_inv", 5))),
+                                  requote=Decimal(str(cfg.get("requote", "0.1"))),
+                                  latency_ns=int(cfg.get("latency_ms", 150)) * 1_000_000)
+            if sym in self.instruments:
+                mm.set_instrument(self.instruments[sym])
+            self.paper[sym] = mm
+
+    def _paper_lines(self, lines):
+        return [self._line(x) for x in lines]
 
     # ---------- helpers ----------
     def _count(self, key, n=1):
@@ -127,6 +148,9 @@ class StateMachine:
         if type_ == "conn_open":
             self.conns[conn] = "connecting"
         elif type_ == "ws_open":
+            if conn == "kraken":
+                for mm in self.paper.values():
+                    out.extend(self._paper_lines(mm.on_disconnect(self.now)))
             self.conns[conn] = "open"
             self._reconnect_pending.discard(conn)
             self._invalidate_venue(conn)  # wait for fresh snapshots
@@ -134,6 +158,9 @@ class StateMachine:
                 self.cb_last_seq = None  # sequence numbers restart per connection
             out.append(self._line(f"{conn} connected"))
         elif type_ == "conn_close":
+            if conn == "kraken":
+                for mm in self.paper.values():
+                    out.extend(self._paper_lines(mm.on_disconnect(self.now)))
             self.conns[conn] = "closed"
             self._invalidate_venue(conn)
             if conn == "kraken_priv":
@@ -152,12 +179,15 @@ class StateMachine:
             sym = event["data"].get("test_order")
             if sym and self.test_phase == "off":
                 self.test_symbol, self.test_phase = sym, "waiting"
+            if event["data"].get("paper_mm") and not self.paper:
+                self._enable_paper(event["data"]["paper_mm"])
         elif type_ == "action":
             self._check_logged_action(event["data"], out)
         elif type_ == "action_rejected":
             self._action_rejected(event["data"], out)
         elif type_ == "timer":
-            pass  # nothing to update: it exists so the steps below run even in a quiet market
+            for mm in self.paper.values():
+                out.extend(self._paper_lines(mm.on_timer(self.now)))
 
         # Time-based decisions run after EVERY event, timer ticks included.
         self._test_order_step(out)
@@ -209,18 +239,30 @@ class StateMachine:
                     self.last_top.pop(key, None)
                     out.append(self._line(f"kraken {symbol} CHECKSUM MISMATCH - reconnecting"))
                     self._request_reconnect(out, "kraken", f"checksum mismatch {symbol}")
+                    if symbol in self.paper:
+                        out.extend(self._paper_lines(self.paper[symbol].on_book(self.now, book, False)))
                     continue
                 self._count("kraken.checksum_ok")
                 line = self._top_line("kraken", symbol)
                 if line:
                     out.append(line)
+                if symbol in self.paper:
+                    out.extend(self._paper_lines(self.paper[symbol].on_book(self.now, book, True)))
         elif channel == "trade":
             self._count("kraken.trades", len(msg.get("data", [])))
+            if msg.get("type") == "update":  # never the snapshot of old trades
+                for tr in msg.get("data", []):
+                    mm = self.paper.get(tr.get("symbol"))
+                    if mm:
+                        out.extend(self._paper_lines(
+                            mm.on_trade(self.now, tr["side"], tr["price"], tr["qty"])))
         elif channel == "instrument":
             for pair in (msg.get("data") or {}).get("pairs", []):
                 self.instruments[pair["symbol"]] = {
                     k: pair.get(k) for k in ("price_increment", "qty_increment", "qty_min",
                                              "cost_min", "status")}
+                if pair["symbol"] in self.paper:
+                    self.paper[pair["symbol"]].set_instrument(self.instruments[pair["symbol"]])
         elif msg.get("method") == "subscribe" and msg.get("success") is False:
             out.append(self._line(f"kraken subscribe error: {msg.get('error')}"))
 
@@ -361,4 +403,12 @@ class StateMachine:
             lines.append(f"summary actions.not_in_log={len(self._expected)}")
         if self.test_phase != "off":
             lines.append(f"summary test_order={self.test_phase}")
+        if self.paper:
+            total = (self.now - self.first_t) if self.now is not None else 0
+            cfg = self.paper_config
+            lines.append(f"summary paper settings spread={Decimal(cfg['spread']) * 100}% "
+                         f"max_inv={cfg.get('max_inv', 5)}x requote={cfg.get('requote', '0.1')} "
+                         f"latency={cfg.get('latency_ms', 150)}ms")
+            for sym in sorted(self.paper):
+                lines.extend(self.paper[sym].summary_lines(total))
         return lines

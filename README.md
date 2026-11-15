@@ -1,7 +1,7 @@
 # mm-stack
 
 A small market-making trading stack, built step by step from the "minimal HFT
-stack" guide. **Steps 1–7 are done** (8–9 are Linux speed work, saved for later):
+stack" guide. **Steps 1–7 and step 10 (paper mode) are done** (8–9 are Linux speed work, saved for later):
 
 1. Record everything that happens on the network (Kraken + Coinbase public
    feeds) to an append-only log file, with local timestamps.
@@ -68,6 +68,44 @@ python -m mmstack.main replay E:\mmdata\20261113-111358.jsonl.gz
 
 Options: `--kraken "BTC/USD,ETH/USD"`, `--coinbase "BTC-USD"`, and `--kraken ""`
 to turn a venue off.
+
+## Step 10 (paper mode): the market maker, with simulated orders
+
+Nothing is sent to an exchange. It runs inside the state machine, so it works
+live **and on any recorded log** — you can try many settings on the same data:
+
+```
+python -m mmstack.main replay E:\mmdata\<log>.jsonl.gz --paper-mm --mm-spread 0.05
+python -m mmstack.main replay E:\mmdata\<log>.jsonl.gz --paper-mm --mm-spread 0.01
+python -m mmstack.main live --paper-mm --data-dir E:\mmdata          (records the settings in the log)
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--paper-mm [SYMBOLS]` | `BTC/USD,LINK/USD` | turn it on (Kraken symbols) |
+| `--mm-spread` | `0.05` | distance of each quote from mid, in % |
+| `--mm-max-inv` | `5` | max inventory, in order sizes |
+| `--mm-requote` | `0.1` | only move a quote when it's off by this fraction of the distance |
+| `--mm-latency-ms` | `150` | a new quote isn't live until this much later (we measured ~110 ms) |
+
+How it works:
+- **Quotes** at the spread each side of mid, rounded away from mid to Kraken's tick.
+  Size = Kraken's minimum (or ~$5 if the log has no instrument data).
+- **Skew (the guide's formula)**, x = |inventory| / max: the side that adds
+  inventory moves out by `spread * x / (1 - x)`, the side that reduces it moves
+  in by `spread * x`. At the max, the adding side isn't quoted.
+- **Fills** only when a real Kraken trade prints *through* our price. A trade
+  exactly at our price doesn't count (we'd be at the back of the queue).
+- **Stale-data guard**: no quotes if the book is invalid or quiet for 10 s.
+- Inventory is relative to a starting holding, so it can go negative.
+
+The summary shows, per symbol:
+- fills, volume, ending inventory
+- **PnL** (inventory valued at mid) at 0%, 0.10% and 0.40% fees, and the
+  **break-even fee** (negative = loses money even with no fees)
+- **markouts**: after each fill, how far mid moved for (+) or against (−) us
+  after 1 s, 5 s, 30 s, in basis points (1 bp = 0.01%). Negative = picked off.
+- requotes, stale pulls, % of time quoted
 
 ## Step 5: the test order
 
@@ -156,6 +194,7 @@ summary kraken.checksum_ok=48211
 | `mmstack/eventlog.py` | `EventWriter` (append + flush every event), `EventTailer` (follow a growing file or read a `.gz`, in 1 MB batches, never half a line), `compress_log`. |
 | `mmstack/books.py` | Order book in exact `Decimal`s; Kraken checksum. |
 | `mmstack/state.py` | The state machine: books, actions, the test order. Time comes only from events. |
+| `mmstack/paper_mm.py` | Step 10 paper market maker: quotes, skew, simulated fills, PnL, markouts. |
 | `mmstack/kraken_private.py` | Kraken private WebSocket: executions feed, add/cancel orders, safety rules. |
 | `mmstack/kraken_auth.py` | API keys, request signing, WebSocket token (all redacted in logs). |
 | `mmstack/venues.py` | Exchange URLs and subscribe messages. |
