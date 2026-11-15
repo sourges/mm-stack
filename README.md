@@ -86,7 +86,9 @@ python -m mmstack.main live --paper-mm --data-dir E:\mmdata          (records th
 | `--mm-spread` | `0.05` | distance of each quote from mid, in % |
 | `--mm-max-inv` | `5` | max inventory, in order sizes |
 | `--mm-requote` | `0.1` | only move a quote when it's off by this fraction of the distance |
-| `--mm-latency-ms` | `150` | a new quote isn't live until this much later (we measured ~110 ms) |
+| `--mm-latency-ms` | `150` | time for a new quote to go live, or an old one to be cancelled (we measured ~110 ms) |
+| `--mm-fills` | `queue` | fill rule: `queue` (queue position) or `through` (the old, harsher rule) |
+| `--mm-no-skew` | off | baseline: no inventory skew (the max-inventory cap stays on) |
 
 How it works:
 - **Quotes** at the spread each side of mid, rounded away from mid to Kraken's tick.
@@ -94,18 +96,35 @@ How it works:
 - **Skew (the guide's formula)**, x = |inventory| / max: the side that adds
   inventory moves out by `spread * x / (1 - x)`, the side that reduces it moves
   in by `spread * x`. At the max, the adding side isn't quoted.
-- **Fills** only when a real Kraken trade prints *through* our price. A trade
-  exactly at our price doesn't count (we'd be at the back of the queue).
-- **Stale-data guard**: no quotes if the book is invalid or quiet for 10 s.
+- **Order timing.** A new quote is live only after the latency. A quote we
+  decide to move or pull **stays live for the latency** and can still be
+  filled (a "stale" fill). One change in flight per side at a time.
+- **Fills, `queue` rule.** When a quote goes live we note the size already
+  resting at its price: the queue ahead of us.
+  - A trade *at* our price uses up the queue ahead first; the rest fills us.
+  - A trade *through* our price fills us completely.
+  - Size that leaves our level without a trade is a cancel, assumed spread
+    evenly through the queue. Size added joins behind us.
+  - We only record the top 10 levels. If our price is outside them, the queue
+    is unknown: no at-price fills, and when the level comes into view we
+    assume all of it is ahead of us. `queue_visible` in the summary says how
+    often the queue could be seen when a quote went live.
+- **Stale-data guard**: quotes are pulled if the book is invalid or quiet for 10 s.
 - Inventory is relative to a starting holding, so it can go negative.
 
 The summary shows, per symbol:
-- fills, volume, ending inventory
+- fills (at our price / through our price / stale), volume, ending inventory
 - **PnL** (inventory valued at mid) at 0%, 0.10% and 0.40% fees, and the
   **break-even fee** (negative = loses money even with no fees)
+- **pnl_split**: *spread earned* (how far each fill was from mid at that
+  moment) and *inventory drift* (everything else). They add up to the 0% PnL.
 - **markouts**: after each fill, how far mid moved for (+) or against (−) us
   after 1 s, 5 s, 30 s, in basis points (1 bp = 0.01%). Negative = picked off.
-- requotes, stale pulls, % of time quoted
+  Also the 1 s figure by fill type.
+- requotes (total and per minute), stale pulls, % of time quoted
+- **rate_limit_blocked**: the share of our order actions Kraken's per-pair
+  rate counter would have refused, for each account level (starter /
+  intermediate / pro). It is measured only: the simulation doesn't block them.
 
 ## Step 5: the test order
 

@@ -229,7 +229,9 @@ def paper_config(args):
             "spread": str(Decimal(args.mm_spread) / 100),  # 0.05 (%) -> "0.0005"
             "max_inv": args.mm_max_inv,
             "requote": args.mm_requote,
-            "latency_ms": args.mm_latency_ms}
+            "latency_ms": args.mm_latency_ms,
+            "fills": args.mm_fills,
+            "skew": not args.mm_no_skew}
 
 
 def add_paper_args(p):
@@ -242,7 +244,12 @@ def add_paper_args(p):
     p.add_argument("--mm-requote", default="0.1",
                    help="re-quote only when the price moves this fraction of the distance (default 0.1)")
     p.add_argument("--mm-latency-ms", type=int, default=150,
-                   help="simulated time before a new quote is live (default 150)")
+                   help="simulated time for a new quote to go live, or an old one to be cancelled (default 150)")
+    p.add_argument("--mm-fills", choices=("queue", "through"), default="queue",
+                   help="fill rule: 'queue' = queue position at our price (default); "
+                        "'through' = only trades strictly through our price (old rule)")
+    p.add_argument("--mm-no-skew", action="store_true",
+                   help="baseline: no inventory skew (the max-inventory cap stays on)")
 
 
 def _split(text):

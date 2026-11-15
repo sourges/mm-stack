@@ -77,7 +77,9 @@ class StateMachine:
             mm = PaperMarketMaker(sym, spread=Decimal(cfg["spread"]),
                                   max_inv_multiple=Decimal(str(cfg.get("max_inv", 5))),
                                   requote=Decimal(str(cfg.get("requote", "0.1"))),
-                                  latency_ns=int(cfg.get("latency_ms", 150)) * 1_000_000)
+                                  latency_ns=int(cfg.get("latency_ms", 150)) * 1_000_000,
+                                  fills=cfg.get("fills", "queue"),
+                                  skew=cfg.get("skew", True))
             if sym in self.instruments:
                 mm.set_instrument(self.instruments[sym])
             self.paper[sym] = mm
@@ -408,7 +410,9 @@ class StateMachine:
             cfg = self.paper_config
             lines.append(f"summary paper settings spread={Decimal(cfg['spread']) * 100}% "
                          f"max_inv={cfg.get('max_inv', 5)}x requote={cfg.get('requote', '0.1')} "
-                         f"latency={cfg.get('latency_ms', 150)}ms")
+                         f"latency={cfg.get('latency_ms', 150)}ms "
+                         f"fills={cfg.get('fills', 'queue')} "
+                         f"skew={'on' if cfg.get('skew', True) else 'off'}")
             for sym in sorted(self.paper):
                 lines.extend(self.paper[sym].summary_lines(total))
         return lines
