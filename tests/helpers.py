@@ -91,7 +91,7 @@ def sample_session():
     add("coinbase", "ws_in", {"text": coinbase_l2(1, "snapshot", "BTC-USD",
         [("bid", "45280.01", "0.5"), ("bid", "45279.00", "1.2"), ("offer", "45281.50", "0.3")])})
     add("kraken", "ws_in", {"text": k.message("update", bids=[("45284.0", "0.25000000")])})
-    add("kraken", "ws_in", {"text": '{"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","price":45284.0,"qty":0.1}]}'})
+    add("kraken", "ws_in", {"text": '{"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","side":"buy","price":45284.0,"qty":0.1}]}'})
     add("coinbase", "ws_in", {"text": coinbase_l2(2, "update", "BTC-USD", [("offer", "45281.00", "0.1")])})
     add("coinbase", "ws_in", {"text": coinbase_heartbeat(3)})
     add("kraken", "ws_in", {"text": k.message("update", asks=[("45285.2", "0")])})

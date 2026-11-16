@@ -231,7 +231,9 @@ def paper_config(args):
             "requote": args.mm_requote,
             "latency_ms": args.mm_latency_ms,
             "fills": args.mm_fills,
-            "skew": not args.mm_no_skew}
+            "skew": not args.mm_no_skew,
+            "coinbase": args.mm_coinbase,
+            "rate_tier": args.mm_rate_tier}
 
 
 def add_paper_args(p):
@@ -248,6 +250,12 @@ def add_paper_args(p):
     p.add_argument("--mm-fills", choices=("queue", "through"), default="queue",
                    help="fill rule: 'queue' = queue position at our price (default); "
                         "'through' = only trades strictly through our price (old rule)")
+    p.add_argument("--mm-coinbase", default="0", metavar="WEIGHT",
+                   help="lean quotes toward Coinbase's price: 0 = off (default), 0.65 = suggested")
+    p.add_argument("--mm-rate-tier", choices=("none", "starter", "intermediate", "pro"),
+                   default="intermediate",
+                   help="obey Kraken's order rate limit for this account level "
+                        "(default intermediate; none = only measure it)")
     p.add_argument("--mm-no-skew", action="store_true",
                    help="baseline: no inventory skew (the max-inventory cap stays on)")
 

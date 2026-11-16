@@ -79,7 +79,9 @@ class StateMachine:
                                   requote=Decimal(str(cfg.get("requote", "0.1"))),
                                   latency_ns=int(cfg.get("latency_ms", 150)) * 1_000_000,
                                   fills=cfg.get("fills", "queue"),
-                                  skew=cfg.get("skew", True))
+                                  skew=cfg.get("skew", True),
+                                  ref_weight=Decimal(str(cfg.get("coinbase", "0"))),
+                                  rate_tier=cfg.get("rate_tier", "none"))
             if sym in self.instruments:
                 mm.set_instrument(self.instruments[sym])
             self.paper[sym] = mm
@@ -110,6 +112,9 @@ class StateMachine:
         return actions
 
     def _invalidate_venue(self, venue):
+        if venue == "coinbase":  # the paper market maker must stop using Coinbase's price
+            for mm in self.paper.values():
+                mm.on_reference(self.now, None)
         for key in self.books:
             if key[0] == venue:
                 self.valid[key] = False
@@ -302,6 +307,10 @@ class StateMachine:
                 line = self._top_line("coinbase", symbol)
                 if line:
                     out.append(line)
+                mm = self.paper.get(symbol.replace("-", "/"))  # BTC-USD -> Kraken's BTC/USD
+                if mm is not None:
+                    key = ("coinbase", symbol)
+                    mm.on_reference(self.now, self.books[key].mid() if self.valid.get(key) else None)
         elif channel == "market_trades":
             for ev in msg.get("events", []):
                 self._count("coinbase.trades", len(ev.get("trades", [])))
@@ -412,7 +421,8 @@ class StateMachine:
                          f"max_inv={cfg.get('max_inv', 5)}x requote={cfg.get('requote', '0.1')} "
                          f"latency={cfg.get('latency_ms', 150)}ms "
                          f"fills={cfg.get('fills', 'queue')} "
-                         f"skew={'on' if cfg.get('skew', True) else 'off'}")
+                         f"skew={'on' if cfg.get('skew', True) else 'off'} "
+                         f"coinbase={cfg.get('coinbase', '0')} rate_limit={cfg.get('rate_tier', 'none')}")
             for sym in sorted(self.paper):
                 lines.extend(self.paper[sym].summary_lines(total))
         return lines

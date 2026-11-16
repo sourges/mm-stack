@@ -37,10 +37,21 @@ Fills, mode "queue" (default):
 Fills, mode "through" (the old rule, kept for comparison): only trades
 strictly through our price fill, for at most the trade's size.
 
+Coinbase-adjusted fair price (`ref_weight`, 0 = off): the two exchanges follow
+each other's jumps over about a second, Coinbase a little ahead. We track the
+normal gap between Coinbase's and Kraken's mid (a slow average, ~60 s) and
+centre our quotes on
+    kraken_mid + ref_weight * (coinbase_mid - kraken_mid - normal_gap)
+so when Coinbase has just moved and Kraken hasn't, the quotes lean that way.
+
+Kraken's rate limit (`rate_tier`): with a tier set, the bot tracks Kraken's
+per-pair rate counter itself and holds back any order it couldn't afford,
+always keeping enough room to cancel what it has resting.
+
 Also reported: PnL split into spread earned vs inventory drift, markouts
 (mid move for/against us 1 s, 5 s, 30 s after each fill; negative = picked
 off), re-quotes per minute, and how much of the order flow Kraken's rate
-limits would have blocked. The rate limits are only measured, not enforced.
+limits would have blocked.
 
 Inventory is relative to a starting holding, so it can go negative.
 """
@@ -61,6 +72,10 @@ RATE_TIERS = {"starter": (Decimal(60), Decimal(1)),
               "intermediate": (Decimal(125), Decimal("2.34")),
               "pro": (Decimal(180), Decimal("3.75"))}
 ADD_COST = Decimal(1)
+MAX_CANCEL_COST = Decimal(8)  # room we keep per resting order so it can always be cancelled
+REF_TAU_NS = 60_000_000_000  # the "normal gap" to the reference price averages over ~60 s
+REF_UPDATE_NS = 1_000_000_000  # ...and is updated once a second
+REF_STALE_NS = 2_000_000_000  # ignore a reference price older than this
 CANCEL_COST_BY_AGE = ((5, 8), (10, 6), (15, 5), (45, 4), (90, 2), (300, 1))  # (age < s, points)
 
 
@@ -84,10 +99,15 @@ class RateCounter:
         self.blocked = 0
         self.peak = Decimal(0)
 
-    def charge(self, now, cost):
+    def level(self, now):
+        """The counter right now, after decay."""
         if self.last_t is not None:
             self.counter = max(Decimal(0), self.counter - self.decay * (now - self.last_t) / NS)
         self.last_t = now
+        return self.counter
+
+    def charge(self, now, cost):
+        self.level(now)
         self.actions += 1
         if self.counter + cost > self.threshold:
             self.blocked += 1
@@ -142,7 +162,7 @@ class PaperQuote:
 class PaperMarketMaker:
     def __init__(self, symbol, spread=Decimal("0.0005"), max_inv_multiple=5,
                  requote=Decimal("0.1"), latency_ns=150_000_000, stale_ns=10_000_000_000,
-                 size=None, fills="queue", skew=True):
+                 size=None, fills="queue", skew=True, ref_weight=Decimal(0), rate_tier=None):
         if fills not in ("queue", "through"):
             raise ValueError(f"fills must be 'queue' or 'through', not {fills!r}")
         self.symbol = symbol
@@ -154,6 +174,10 @@ class PaperMarketMaker:
         self.fixed_size = Decimal(size) if size is not None else None
         self.fill_mode = fills
         self.skew = skew
+        self.ref_weight = Decimal(ref_weight)
+        if rate_tier not in (None, "none") and rate_tier not in RATE_TIERS:
+            raise ValueError(f"unknown rate tier {rate_tier!r}")
+        self.rate_tier = None if rate_tier in (None, "none") else rate_tier
 
         self.size = self.fixed_size  # order size; if None, decided once we know prices
         self.tick = None
@@ -175,6 +199,13 @@ class PaperMarketMaker:
                       "buys": 0, "sells": 0, "quoted_ns": 0,
                       "queue_seen": 0, "queue_unseen": 0}
         self.rate = {name: RateCounter(*cfg) for name, cfg in RATE_TIERS.items()}
+        self._held = {"bid": False, "ask": False}  # currently holding back this side's order
+        self.stats.update({"held_back": 0, "cancel_blocked": 0, "quotes_with_ref": 0, "quote_calcs": 0})
+        # reference (Coinbase) price
+        self.ref_mid = None
+        self.ref_t = None
+        self.ref_gap = None  # slow average of (ref_mid - our mid)
+        self._gap_t = None
         self._last_t = None
 
     # kept for convenience (and tests)
@@ -250,6 +281,7 @@ class PaperMarketMaker:
     def on_timer(self, now):
         self._advance(now)
         if self.pulled:
+            self._cancel_all(now)  # in case the rate limit blocked a cancel earlier
             return []
         if self.last_book_t is None or now - self.last_book_t > self.stale_ns:
             return self._pull(now)
@@ -278,6 +310,43 @@ class PaperMarketMaker:
         if out and self.book_ok and not self.pulled:
             self._quote(now, self._book)  # inventory changed: move to the new skew
         return out
+
+    def on_reference(self, now, ref_mid):
+        """The other exchange's mid changed (None = its book can't be trusted)."""
+        if not self.ref_weight:
+            return []  # signal off: behave exactly as if Coinbase weren't there
+        self._advance(now)
+        self.ref_mid = ref_mid
+        self.ref_t = now if ref_mid is not None else None
+        if ref_mid is None:
+            self.ref_gap = self._gap_t = None  # start the average again when it comes back
+        if self.book_ok and not self.pulled:
+            self._update_gap(now)
+            self._quote(now, self._book)
+        return []
+
+    def _update_gap(self, now):
+        """Slow average of the normal price gap between the two exchanges."""
+        if self.ref_mid is None or self.last_mid is None:
+            return
+        gap = self.ref_mid - self.last_mid
+        if self.ref_gap is None:
+            self.ref_gap, self._gap_t = gap, now
+            return
+        dt = now - self._gap_t
+        if dt >= REF_UPDATE_NS:
+            self.ref_gap += (gap - self.ref_gap) * dt / (REF_TAU_NS + dt)
+            self._gap_t = now
+
+    def fair_price(self, now):
+        """Centre for our quotes: our mid, leaned toward where the reference
+        exchange says the price is heading."""
+        self.stats["quote_calcs"] += 1
+        if (not self.ref_weight or self.ref_mid is None or self.ref_gap is None
+                or now - self.ref_t > REF_STALE_NS):
+            return self.last_mid
+        self.stats["quotes_with_ref"] += 1
+        return self.last_mid + self.ref_weight * (self.ref_mid - self.last_mid - self.ref_gap)
 
     def on_disconnect(self, now):
         self._advance(now)
@@ -376,7 +445,9 @@ class PaperMarketMaker:
         return bid, ask
 
     def _quote(self, now, book):
-        bid_p, ask_p = self.wanted_quotes(self.last_mid)
+        if self.ref_weight:
+            self._update_gap(now)
+        bid_p, ask_p = self.wanted_quotes(self.fair_price(now))
         # never cross the book (we only ever want to be a maker)
         if bid_p is not None and book.best_ask() is not None and bid_p >= book.best_ask():
             bid_p = book.best_ask() - self.tick
@@ -390,20 +461,47 @@ class PaperMarketMaker:
         for counter in self.rate.values():
             counter.charge(now, cost)
 
+    def _open_orders(self):
+        """Orders we may still have to cancel (ones already being cancelled are paid for)."""
+        resting = sum(1 for q in self.cur.values() if q is not None and q.dead_at is None)
+        return resting + sum(1 for q in self.nxt.values() if q is not None)
+
+    def _affordable(self, now, side, cost, orders_after):
+        """Rate limit check for a NEW order (or a re-quote). We only send it if,
+        afterwards, there is still room to cancel every order we have resting."""
+        if self.rate_tier is None:
+            return True
+        counter = self.rate[self.rate_tier]
+        if counter.level(now) + cost + MAX_CANCEL_COST * orders_after <= counter.threshold:
+            self._held[side] = False
+            return True
+        if not self._held[side]:  # count each hold-back once, not every time we re-check
+            self._held[side] = True
+            self.stats["held_back"] += 1
+        return False
+
     def _new_quote(self, now, price):
         self.stats["places"] += 1
         self._charge(now, ADD_COST)
         return PaperQuote(price, self.size, now, now + self.latency_ns)
 
     def _cancel(self, now, q):
+        """Returns False if the rate limit refuses the cancel (the quote stays live)."""
+        cost = cancel_cost(now - q.placed_t)
+        if self.rate_tier is not None:
+            counter = self.rate[self.rate_tier]
+            if counter.level(now) + cost > counter.threshold:
+                self.stats["cancel_blocked"] += 1
+                return False
         self.stats["cancels"] += 1
-        self._charge(now, cancel_cost(now - q.placed_t))
+        self._charge(now, cost)
         q.dead_at = now + self.latency_ns
+        return True
 
     def _move(self, now, side, price, threshold):
         q = self.cur[side]
         if q is None:
-            if price is not None:
+            if price is not None and self._affordable(now, side, ADD_COST, self._open_orders() + 1):
                 self.cur[side] = self._new_quote(now, price)
             return
         if q.dead_at is not None or now < q.live_at:
@@ -413,19 +511,25 @@ class PaperMarketMaker:
             return
         if abs(q.price - price) < threshold and q.size == self.size:
             return  # close enough: keep our place in the queue
+        cost = cancel_cost(now - q.placed_t) + ADD_COST
+        if not self._affordable(now, side, cost, self._open_orders()):
+            return  # can't afford to move it yet: it stays where it is
         self.stats["requotes"] += 1
         self._cancel(now, q)
         self.nxt[side] = self._new_quote(now, price)
 
-    def _pull(self, now):
-        if self.pulled:
-            return []
-        self.pulled = True
+    def _cancel_all(self, now):
         for side in ("bid", "ask"):
             q = self.cur[side]
             self.nxt[side] = None
             if q is not None and q.dead_at is None:
                 self._cancel(now, q)
+
+    def _pull(self, now):
+        if self.pulled:
+            return []
+        self.pulled = True
+        self._cancel_all(now)
         self.stats["stale_pulls"] += 1
         return [f"PAPER {self.symbol} quotes pulled (book stale or invalid)"]
 
@@ -497,4 +601,13 @@ class PaperMarketMaker:
             for name, c in self.rate.items())
         lines.append(f"summary paper {s} rate_limit_blocked {blocked} "
                      f"(order actions={self.stats['places'] + self.stats['cancels']})")
+        if self.rate_tier is not None:
+            lines.append(f"summary paper {s} rate_limit enforced={self.rate_tier} "
+                         f"held_back={self.stats['held_back']} "
+                         f"cancel_blocked={self.stats['cancel_blocked']} "
+                         f"peak={self.rate[self.rate_tier].peak:.0f}/{self.rate[self.rate_tier].threshold}")
+        if self.ref_weight:
+            calcs = self.stats["quote_calcs"]
+            used = f"{Decimal(self.stats['quotes_with_ref']) / calcs * 100:.0f}%" if calcs else "n/a"
+            lines.append(f"summary paper {s} coinbase_signal weight={self.ref_weight} used={used}")
         return lines

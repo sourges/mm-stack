@@ -89,6 +89,8 @@ python -m mmstack.main live --paper-mm --data-dir E:\mmdata          (records th
 | `--mm-latency-ms` | `150` | time for a new quote to go live, or an old one to be cancelled (we measured ~110 ms) |
 | `--mm-fills` | `queue` | fill rule: `queue` (queue position) or `through` (the old, harsher rule) |
 | `--mm-no-skew` | off | baseline: no inventory skew (the max-inventory cap stays on) |
+| `--mm-coinbase` | `0` | lean the quotes toward Coinbase's price: `0` = off, `0.65` = suggested |
+| `--mm-rate-tier` | `intermediate` | obey Kraken's order rate limit for this account level (`starter`, `intermediate`, `pro`); `none` = only measure it |
 
 How it works:
 - **Quotes** at the spread each side of mid, rounded away from mid to Kraken's tick.
@@ -109,6 +111,16 @@ How it works:
     is unknown: no at-price fills, and when the level comes into view we
     assume all of it is ahead of us. `queue_visible` in the summary says how
     often the queue could be seen when a quote went live.
+- **Coinbase-adjusted fair price** (`--mm-coinbase`). The two exchanges
+  follow each other's jumps over about a second, Coinbase slightly ahead. The
+  bot tracks the normal gap between Coinbase's and Kraken's mid (a ~60 s
+  average) and centres its quotes on
+  `kraken_mid + weight * (coinbase_mid - kraken_mid - normal_gap)`.
+  It needs the matching Coinbase product in the recording (BTC/USD ↔ BTC-USD).
+- **Kraken's rate limit** (`--mm-rate-tier`). The bot keeps Kraken's per-pair
+  rate counter itself (new order +1; cancel +8 if the order is under 5 s old,
+  less as it ages; decays every second). It holds back any new order or
+  re-quote it couldn't afford, always keeping room to cancel what it has resting.
 - **Stale-data guard**: quotes are pulled if the book is invalid or quiet for 10 s.
 - Inventory is relative to a starting holding, so it can go negative.
 
@@ -124,7 +136,13 @@ The summary shows, per symbol:
 - requotes (total and per minute), stale pulls, % of time quoted
 - **rate_limit_blocked**: the share of our order actions Kraken's per-pair
   rate counter would have refused, for each account level (starter /
-  intermediate / pro). It is measured only: the simulation doesn't block them.
+  intermediate / pro), had it not held anything back.
+- **rate_limit enforced=...**: how many times an order was held back, cancels
+  refused (should be 0), and the counter's peak against the limit.
+- **coinbase_signal**: the weight, and how often Coinbase's price was usable.
+
+Paper results recorded in a live log before a setting existed replay with the
+old behaviour for that setting, so old logs still replay as they ran.
 
 ## Research: does Coinbase move before Kraken?
 
