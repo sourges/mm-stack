@@ -126,6 +126,20 @@ The summary shows, per symbol:
   rate counter would have refused, for each account level (starter /
   intermediate / pro). It is measured only: the simulation doesn't block them.
 
+## Research: does Coinbase move before Kraken?
+
+```
+python -m mmstack.main leadlag E:\mmdata\<log>.jsonl.gz --out leadlag.txt
+```
+
+Samples both BTC mids every 50 ms (by our receive time) and prints:
+- the correlation of 50 ms price changes at different delays. A peak at
+  `+100 ms` means Coinbase's moves show up on Kraken about 100 ms later.
+- an event study: each time one exchange jumps 2 bps within 100 ms, how much
+  the other had already moved and how much it moved over the next second.
+
+Options: `--kraken LINK/USD --coinbase LINK-USD`, `--jump-bps 1`, `--step-ms 50`.
+
 ## Step 5: the test order
 
 ### 1. Kraken API key (new key, just for mm-stack)

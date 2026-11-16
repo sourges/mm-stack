@@ -252,6 +252,21 @@ def add_paper_args(p):
                    help="baseline: no inventory skew (the max-inventory cap stays on)")
 
 
+def run_leadlag(args):
+    from . import leadlag
+    pairs = {f"kraken {args.kraken}": ("kraken", args.kraken),
+             f"coinbase {args.coinbase}": ("coinbase", args.coinbase)}
+    tailer = EventTailer(args.log)
+    series, _ = leadlag.sample_mids(tailer, pairs, args.step_ms * 1_000_000)
+    tailer.close()
+    out = Output(args.out)
+    names = list(pairs)
+    for line in leadlag.report(series, names[1], names[0], args.step_ms,
+                               threshold_bps=float(args.jump_bps)):
+        out.emit(line)
+    out.close()
+
+
 def _split(text):
     return [s.strip() for s in text.split(",") if s.strip()] if text else []
 
@@ -290,6 +305,15 @@ def main(argv=None):
     comp.add_argument("--delete", action="store_true",
                       help="delete each original after its .gz is verified")
     comp.set_defaults(func=run_compress)
+
+    ll = sub.add_parser("leadlag", help="research: does Coinbase's price move before Kraken's?")
+    ll.add_argument("log")
+    ll.add_argument("--kraken", default="BTC/USD")
+    ll.add_argument("--coinbase", default="BTC-USD")
+    ll.add_argument("--step-ms", type=int, default=50, help="sampling step (default 50)")
+    ll.add_argument("--jump-bps", default="2", help="size of a 'jump' in the event study (default 2)")
+    ll.add_argument("--out", help="also write the report to this file")
+    ll.set_defaults(func=run_leadlag)
 
     args = p.parse_args(argv)
     args.func(args)
