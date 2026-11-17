@@ -38,6 +38,17 @@ Record live (BTC and LINK on both exchanges by default). Stop with Ctrl+C:
 python -m mmstack.main live --out out_live.txt
 ```
 
+The screen stays quiet: one status line a minute (events so far, log size,
+how far behind the strategy side is) plus the important events (connects,
+disconnects, checksum or sequence errors, orders, paper fills). Every line
+still goes to the `--out` file, so the `fc` check below is unchanged. Add
+`--verbose` to see every price line on screen.
+
+Ctrl+C stops the recorder at once, then the unread part of the log is
+finished so the summary is complete. Press Ctrl+C a second time to skip that
+(the summary is then marked INCOMPLETE; the log itself is whole, replay it).
+Run long recordings in a plain Command Prompt, not the VS Code terminal.
+
 It prints where the log went, e.g. `data\20261112-170500.jsonl`. Then replay it:
 
 ```

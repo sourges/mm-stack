@@ -37,15 +37,31 @@ from .state import StateMachine
 POLL_SECONDS = 0.01  # how often the follower checks the file for new lines
 
 
-class Output:
-    """Prints lines and, if asked, also writes them to a file."""
+# Lines worth seeing on screen in quiet mode. Everything else (mostly the
+# price line printed on every top-of-book change) goes only to the --out file.
+IMPORTANT = ("connected", "ACTION", "TEST ORDER", "order ", "MISMATCH", "GAP", "error",
+             "rejected", "PAPER FILL", "pulled", "summary", "executions ready")
+STATUS_SECONDS = 60
 
-    def __init__(self, path=None, stream=None):
+
+def is_important(line):
+    return any(tag in line for tag in IMPORTANT)
+
+
+class Output:
+    """Writes every line to the --out file. On screen it shows either every
+    line (quiet=False) or only the important ones (quiet=True)."""
+
+    def __init__(self, path=None, stream=None, quiet=False):
         self._stream = stream or sys.stdout
         self._f = open(path, "w", encoding="utf-8", newline="\n") if path else None
+        self.quiet = quiet
+        self.lines = 0
 
     def emit(self, line):
-        print(line, file=self._stream)
+        self.lines += 1
+        if not self.quiet or is_important(line):
+            print(line, file=self._stream)
         if self._f:
             self._f.write(line + "\n")
 
@@ -54,16 +70,31 @@ class Output:
             self._f.close()
 
 
+def status_line(wall_ns, last_event_ns, events, log_bytes):
+    """One line saying the recorder is alive and whether the strategy side is
+    keeping up. `behind` is how old the newest processed event is."""
+    clock = datetime.fromtimestamp(wall_ns / 1e9).strftime("%H:%M:%S")
+    if last_event_ns is None:
+        return f"[{clock}] waiting for data"
+    behind = max(0.0, (wall_ns - last_event_ns) / 1e9)
+    warn = "  <-- falling behind" if behind > 5 else ""
+    return (f"[{clock}] {events:,} events, log {log_bytes / 1e6:,.0f} MB, "
+            f"{behind:.1f}s behind{warn}")
+
+
 def consume(tailer, sm, out, follow, should_stop=lambda: False, poll=POLL_SECONDS,
-            on_action=None):
+            on_action=None, on_batch=None):
     """Feed every complete event in the log to the state machine.
 
-    follow=False: stop at the end of the file (replay).
-    follow=True:  keep waiting for new lines until should_stop() is true.
+    follow=False: read to the end of the file (replay, or the final catch-up).
+    follow=True:  keep waiting for new lines.
+    should_stop() is checked after EVERY batch, including when we are behind
+    the recorder, so Ctrl+C always works. It is never checked in the middle of
+    an event, so the state machine can't be left half-updated.
     on_action(action) is called for every action the state machine produces
     (live: log it, then send it). In replay it is None: actions are dropped.
-    We only check should_stop() between batches, never in the middle of an
-    event, so a Ctrl+C can't leave the state machine half-updated.
+    on_batch(last_event, n_events) is called after each batch (status line).
+    Returns True if it stopped because should_stop() said so.
     """
     while True:
         events = tailer.read_available()
@@ -73,9 +104,13 @@ def consume(tailer, sm, out, follow, should_stop=lambda: False, poll=POLL_SECOND
             for action in sm.take_actions():
                 if on_action is not None:
                     on_action(action)
+        if on_batch is not None:
+            on_batch(events[-1] if events else None, len(events))
+        if should_stop():
+            return True
         if not events:
-            if not follow or should_stop():
-                return
+            if not follow:
+                return False
             time.sleep(poll)
 
 
@@ -139,27 +174,53 @@ def run_live(args):
 
     net_thread = threading.Thread(target=net_main, name="net", daemon=True)
 
-    stop_requested = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: stop_requested.set())
+    presses = []  # one entry per Ctrl+C
+    signal.signal(signal.SIGINT, lambda *_: presses.append(1))
+    if hasattr(signal, "SIGBREAK"):  # Ctrl+Break on Windows
+        signal.signal(signal.SIGBREAK, lambda *_: presses.append(1))
 
-    out = Output(args.out)
+    out = Output(args.out, quiet=not args.verbose)
     print(f"logging to {log_path}  (Ctrl+C to stop)", file=sys.stderr)
+    if out.quiet:
+        print(f"quiet screen: a status line every {STATUS_SECONDS}s plus important events. "
+              "Use --verbose to see every price line.", file=sys.stderr)
     net_thread.start()
     tailer = EventTailer(log_path)
     sm = StateMachine()
+    progress = {"events": 0, "last_t": None, "next_status": time.time() + STATUS_SECONDS}
 
+    def on_batch(last_event, n):
+        progress["events"] += n
+        if last_event is not None:
+            progress["last_t"] = last_event["t"]
+        if time.time() >= progress["next_status"]:
+            progress["next_status"] = time.time() + STATUS_SECONDS
+            print(status_line(time.time_ns(), progress["last_t"], progress["events"],
+                              os.path.getsize(log_path)), file=sys.stderr)
+
+    caught_up = True
     try:
         consume(tailer, sm, out, follow=True, on_action=action_sink(writer, reactor),
-                should_stop=lambda: stop_requested.is_set() or not net_thread.is_alive())
+                on_batch=on_batch,
+                should_stop=lambda: bool(presses) or not net_thread.is_alive())
     finally:
         net_stop.set()
         net_thread.join(timeout=10)
         writer.close()
-        # Drain the last lines. Network is stopped, so any action now is not sent
-        # (and not logged); replay will show it as actions.not_in_log too.
-        consume(tailer, sm, out, follow=False)
+        # Catch up on whatever the recorder wrote that we haven't processed yet.
+        # Network is stopped, so any action now is not sent (and not logged);
+        # replay will show it as actions.not_in_log too.
+        first = len(presses)
+        print("stopping: recorder stopped, finishing the unread part of the log "
+              "(Ctrl+C again to skip)...", file=sys.stderr)
+        skipped = consume(tailer, sm, out, follow=False, on_batch=on_batch,
+                          should_stop=lambda: len(presses) > first)
+        caught_up = not skipped
         for line in sm.summary():
             out.emit(line)
+        if not caught_up:
+            out.emit("summary INCOMPLETE: stopped before reading the whole log; "
+                     "replay the log for the full result")
         out.close()
         tailer.close()
         print(f"log saved: {log_path}", file=sys.stderr)
@@ -289,6 +350,8 @@ def main(argv=None):
     live.add_argument("--data-dir", default="data")
     live.add_argument("--log", help="log file path (must not exist yet)")
     live.add_argument("--out", help="also write output lines to this file")
+    live.add_argument("--verbose", action="store_true",
+                      help="print every line on screen (default: status line + important events)")
     live.add_argument("--private", action="store_true",
                       help="connect the Kraken private feed (your orders), no trading")
     live.add_argument("--enable-trading", action="store_true",
