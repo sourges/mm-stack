@@ -294,7 +294,10 @@ def paper_config(args):
             "fills": args.mm_fills,
             "skew": not args.mm_no_skew,
             "coinbase": args.mm_coinbase,
-            "rate_tier": args.mm_rate_tier}
+            "rate_tier": args.mm_rate_tier,
+            "alarm_bps": args.mm_alarm_bps,
+            "alarm_window_ms": args.mm_alarm_window_ms,
+            "alarm_hold_ms": args.mm_alarm_hold_ms}
 
 
 def add_paper_args(p):
@@ -313,6 +316,13 @@ def add_paper_args(p):
                         "'through' = only trades strictly through our price (old rule)")
     p.add_argument("--mm-coinbase", default="0", metavar="WEIGHT",
                    help="lean quotes toward Coinbase's price: 0 = off (default), 0.65 = suggested")
+    p.add_argument("--mm-alarm-bps", default="0", metavar="BPS",
+                   help="Coinbase alarm: take one side off after Coinbase jumps this many bps "
+                        "(0 = off, default; 2 = suggested)")
+    p.add_argument("--mm-alarm-window-ms", type=int, default=100,
+                   help="...within this many ms (default 100)")
+    p.add_argument("--mm-alarm-hold-ms", type=int, default=1000,
+                   help="...and keep that side off this long (default 1000)")
     p.add_argument("--mm-rate-tier", choices=("none", "starter", "intermediate", "pro"),
                    default="intermediate",
                    help="obey Kraken's order rate limit for this account level "

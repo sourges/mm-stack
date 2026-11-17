@@ -56,6 +56,7 @@ limits would have blocked.
 Inventory is relative to a starting holding, so it can go negative.
 """
 
+from collections import deque
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from .venues import KRAKEN_BOOK_DEPTH
@@ -162,7 +163,8 @@ class PaperQuote:
 class PaperMarketMaker:
     def __init__(self, symbol, spread=Decimal("0.0005"), max_inv_multiple=5,
                  requote=Decimal("0.1"), latency_ns=150_000_000, stale_ns=10_000_000_000,
-                 size=None, fills="queue", skew=True, ref_weight=Decimal(0), rate_tier=None):
+                 size=None, fills="queue", skew=True, ref_weight=Decimal(0), rate_tier=None,
+                 alarm_bps=Decimal(0), alarm_window_ns=100_000_000, alarm_hold_ns=1_000_000_000):
         if fills not in ("queue", "through"):
             raise ValueError(f"fills must be 'queue' or 'through', not {fills!r}")
         self.symbol = symbol
@@ -178,6 +180,9 @@ class PaperMarketMaker:
         if rate_tier not in (None, "none") and rate_tier not in RATE_TIERS:
             raise ValueError(f"unknown rate tier {rate_tier!r}")
         self.rate_tier = None if rate_tier in (None, "none") else rate_tier
+        self.alarm_bps = Decimal(alarm_bps)  # 0 = alarm off
+        self.alarm_window_ns = alarm_window_ns
+        self.alarm_hold_ns = alarm_hold_ns
 
         self.size = self.fixed_size  # order size; if None, decided once we know prices
         self.tick = None
@@ -207,6 +212,11 @@ class PaperMarketMaker:
         self.ref_gap = None  # slow average of (ref_mid - our mid)
         self._gap_t = None
         self._last_t = None
+        # alarm: a fast jump on the reference exchange takes one side off for a while
+        self._ref_hist = deque()  # (time, reference mid) inside the alarm window
+        self.alarm_until = {"bid": 0, "ask": 0}  # that side stays off until this time
+        self.alarm_off_ns = {"bid": 0, "ask": 0}
+        self.stats.update({"alarms_up": 0, "alarms_down": 0, "alarm_fills": 0})
 
     # kept for convenience (and tests)
     @property
@@ -313,17 +323,50 @@ class PaperMarketMaker:
 
     def on_reference(self, now, ref_mid):
         """The other exchange's mid changed (None = its book can't be trusted)."""
-        if not self.ref_weight:
-            return []  # signal off: behave exactly as if Coinbase weren't there
+        if not self.ref_weight and not self.alarm_bps:
+            return []  # both off: behave exactly as if Coinbase weren't there
         self._advance(now)
         self.ref_mid = ref_mid
         self.ref_t = now if ref_mid is not None else None
+        fired = False
         if ref_mid is None:
             self.ref_gap = self._gap_t = None  # start the average again when it comes back
-        if self.book_ok and not self.pulled:
-            self._update_gap(now)
+            self._ref_hist.clear()  # a jump across an outage is not a jump
+        elif self.alarm_bps:
+            fired = self._check_alarm(now, ref_mid)
+        # with only the alarm on, Coinbase ticks must not cause extra re-quotes
+        if (self.ref_weight or fired) and self.book_ok and not self.pulled:
             self._quote(now, self._book)
         return []
+
+    def _check_alarm(self, now, ref_mid):
+        """Has the reference price jumped alarm_bps or more within the window?
+        Up: our ask is about to be bought too cheaply, so it comes off.
+        Down: the bid comes off. Returns True if an alarm fired."""
+        hist = self._ref_hist
+        while hist and now - hist[0][0] > self.alarm_window_ns:
+            hist.popleft()
+        fired = False
+        if hist:
+            low = min(p for _, p in hist)
+            high = max(p for _, p in hist)
+            if (ref_mid - low) / low * BPS >= self.alarm_bps:
+                fired = self._alarm(now, "ask")
+            elif (high - ref_mid) / high * BPS >= self.alarm_bps:
+                fired = self._alarm(now, "bid")
+        if fired:
+            hist.clear()  # the move must go a further alarm_bps to ring again
+        hist.append((now, ref_mid))
+        return fired
+
+    def _alarm(self, now, side):
+        until = now + self.alarm_hold_ns
+        old = self.alarm_until[side]
+        if old <= now:  # a new alarm, not an extension of one still running
+            self.stats["alarms_up" if side == "ask" else "alarms_down"] += 1
+        self.alarm_off_ns[side] += until - max(old, now)
+        self.alarm_until[side] = until
+        return True
 
     def _update_gap(self, now):
         """Slow average of the normal price gap between the two exchanges."""
@@ -448,6 +491,10 @@ class PaperMarketMaker:
         if self.ref_weight:
             self._update_gap(now)
         bid_p, ask_p = self.wanted_quotes(self.fair_price(now))
+        if now < self.alarm_until["bid"]:
+            bid_p = None  # alarm: stay off this side
+        if now < self.alarm_until["ask"]:
+            ask_p = None
         # never cross the book (we only ever want to be a maker)
         if bid_p is not None and book.best_ask() is not None and bid_p >= book.best_ask():
             bid_p = book.best_ask() - self.tick
@@ -535,6 +582,8 @@ class PaperMarketMaker:
 
     def _fill(self, now, side, quote, qty, kind):
         stale = quote.dead_at is not None
+        if now < self.alarm_until["bid" if side == "buy" else "ask"]:
+            self.stats["alarm_fills"] += 1  # hit before our cancel landed
         quote.size -= qty
         value = qty * quote.price
         if side == "buy":
@@ -610,4 +659,13 @@ class PaperMarketMaker:
             calcs = self.stats["quote_calcs"]
             used = f"{Decimal(self.stats['quotes_with_ref']) / calcs * 100:.0f}%" if calcs else "n/a"
             lines.append(f"summary paper {s} coinbase_signal weight={self.ref_weight} used={used}")
+        if self.alarm_bps:
+            off = {side: (Decimal(ns) / total_ns * 100) if total_ns else Decimal(0)
+                   for side, ns in self.alarm_off_ns.items()}
+            lines.append(f"summary paper {s} coinbase_alarm jump>={self.alarm_bps}bps "
+                         f"within={self.alarm_window_ns // 1_000_000}ms "
+                         f"hold={self.alarm_hold_ns // 1_000_000}ms "
+                         f"alarms up={self.stats['alarms_up']} down={self.stats['alarms_down']} "
+                         f"bid_off={off['bid']:.2f}% ask_off={off['ask']:.2f}% "
+                         f"fills_during_alarm={self.stats['alarm_fills']}")
         return lines

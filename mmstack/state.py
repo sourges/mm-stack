@@ -81,7 +81,10 @@ class StateMachine:
                                   fills=cfg.get("fills", "queue"),
                                   skew=cfg.get("skew", True),
                                   ref_weight=Decimal(str(cfg.get("coinbase", "0"))),
-                                  rate_tier=cfg.get("rate_tier", "none"))
+                                  rate_tier=cfg.get("rate_tier", "none"),
+                                  alarm_bps=Decimal(str(cfg.get("alarm_bps", "0"))),
+                                  alarm_window_ns=int(cfg.get("alarm_window_ms", 100)) * 1_000_000,
+                                  alarm_hold_ns=int(cfg.get("alarm_hold_ms", 1000)) * 1_000_000)
             if sym in self.instruments:
                 mm.set_instrument(self.instruments[sym])
             self.paper[sym] = mm
@@ -422,7 +425,10 @@ class StateMachine:
                          f"latency={cfg.get('latency_ms', 150)}ms "
                          f"fills={cfg.get('fills', 'queue')} "
                          f"skew={'on' if cfg.get('skew', True) else 'off'} "
-                         f"coinbase={cfg.get('coinbase', '0')} rate_limit={cfg.get('rate_tier', 'none')}")
+                         f"coinbase={cfg.get('coinbase', '0')} rate_limit={cfg.get('rate_tier', 'none')}"
+                         + (f" alarm={cfg['alarm_bps']}bps/{cfg.get('alarm_window_ms', 100)}ms"
+                            f"/{cfg.get('alarm_hold_ms', 1000)}ms"
+                            if Decimal(str(cfg.get("alarm_bps", "0"))) else ""))
             for sym in sorted(self.paper):
                 lines.extend(self.paper[sym].summary_lines(total))
         return lines

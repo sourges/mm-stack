@@ -101,6 +101,9 @@ python -m mmstack.main live --paper-mm --data-dir E:\mmdata          (records th
 | `--mm-fills` | `queue` | fill rule: `queue` (queue position) or `through` (the old, harsher rule) |
 | `--mm-no-skew` | off | baseline: no inventory skew (the max-inventory cap stays on) |
 | `--mm-coinbase` | `0` | lean the quotes toward Coinbase's price: `0` = off, `0.65` = suggested |
+| `--mm-alarm-bps` | `0` | Coinbase alarm: take one side off after Coinbase jumps this many bps (`0` = off, `2` = suggested) |
+| `--mm-alarm-window-ms` | `100` | ...within this many ms |
+| `--mm-alarm-hold-ms` | `1000` | ...and keep that side off this long |
 | `--mm-rate-tier` | `intermediate` | obey Kraken's order rate limit for this account level (`starter`, `intermediate`, `pro`); `none` = only measure it |
 
 How it works:
@@ -128,6 +131,15 @@ How it works:
   average) and centres its quotes on
   `kraken_mid + weight * (coinbase_mid - kraken_mid - normal_gap)`.
   It needs the matching Coinbase product in the recording (BTC/USD ↔ BTC-USD).
+- **Coinbase alarm** (`--mm-alarm-bps`). Separate from the fair price above
+  (measured Nov 16: the fair price did not help at 150 ms). Small Coinbase
+  moves are ignored. When Coinbase's mid jumps the set amount within the
+  window, measured from its lowest (or highest) price in the window, the side
+  about to be run over is cancelled: the ask after a jump up, the bid after a
+  jump down. That side stays off for the hold time, then is quoted again. The
+  cancel takes the usual latency, so the quote can still be hit first;
+  `fills_during_alarm` in the summary counts those. `bid_off` / `ask_off` are
+  the share of time each side was held off.
 - **Kraken's rate limit** (`--mm-rate-tier`). The bot keeps Kraken's per-pair
   rate counter itself (new order +1; cancel +8 if the order is under 5 s old,
   less as it ages; decays every second). It holds back any new order or
