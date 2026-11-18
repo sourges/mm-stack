@@ -40,7 +40,8 @@ POLL_SECONDS = 0.01  # how often the follower checks the file for new lines
 # Lines worth seeing on screen in quiet mode. Everything else (mostly the
 # price line printed on every top-of-book change) goes only to the --out file.
 IMPORTANT = ("connected", "ACTION", "TEST ORDER", "order ", "MISMATCH", "GAP", "error",
-             "rejected", "PAPER FILL", "pulled", "summary", "executions ready")
+             "rejected", "PAPER FILL", "pulled", "summary", "executions ready",
+             "BAD BOOK")
 STATUS_SECONDS = 60
 
 
@@ -128,13 +129,15 @@ def action_sink(writer, reactor):
 
 
 def build_clients(writer, kraken_symbols, coinbase_products, keys=None,
-                  private=False, trading_enabled=False):
+                  private=False, trading_enabled=False, binanceus_symbols=None):
     clients = []
     specs = []
     if kraken_symbols:
         specs.append(venues.kraken(kraken_symbols))
     if coinbase_products:
         specs.append(venues.coinbase(coinbase_products))
+    if binanceus_symbols:
+        specs.append(venues.binanceus(binanceus_symbols))
     for s in specs:
         clients.append(WsClient(s["name"], s["host"], s["port"], s["path"],
                                 s["subscribe"], writer))
@@ -161,7 +164,8 @@ def run_live(args):
                                      "private": private, "trading_enabled": args.enable_trading,
                                      "paper_mm": paper_config(args)})
     clients = build_clients(writer, _split(args.kraken), _split(args.coinbase), keys=keys,
-                            private=private, trading_enabled=args.enable_trading)
+                            private=private, trading_enabled=args.enable_trading,
+                            binanceus_symbols=_split(args.binanceus))
     reactor = build_reactor(clients, writer)
     net_stop = threading.Event()
 
@@ -364,6 +368,8 @@ def main(argv=None):
     live = sub.add_parser("live", help="record live market data and run the state machine")
     live.add_argument("--kraken", default="BTC/USD,LINK/USD", help="Kraken symbols, comma separated ('' = off)")
     live.add_argument("--coinbase", default="BTC-USD,LINK-USD", help="Coinbase products, comma separated ('' = off)")
+    live.add_argument("--binanceus", default="BTCUSD,LINKUSD",
+                      help="Binance.US symbols, comma separated ('' = off)")
     live.add_argument("--data-dir", default="data")
     live.add_argument("--log", help="log file path (must not exist yet)")
     live.add_argument("--out", help="also write output lines to this file")

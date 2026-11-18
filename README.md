@@ -32,7 +32,8 @@ on your PATH. That's fine; the live run tests TLS for real.
 
 ## Run
 
-Record live (BTC and LINK on both exchanges by default). Stop with Ctrl+C:
+Record live (BTC and LINK on Kraken, Coinbase and Binance.US by default;
+`--binanceus ''` leaves Binance.US out). Stop with Ctrl+C:
 
 ```
 python -m mmstack.main live --out out_live.txt
@@ -266,6 +267,19 @@ summary kraken.checksum_ok=48211
   A gap means a message was lost, so the book can't be trusted.
 - A bad book triggers `ACTION reconnect` for that exchange (once, until it
   reconnects), and a fresh snapshot rebuilds it.
+- **Binance.US** (`binanceus BTCUSD ...`): it sends the whole top 20 levels
+  every 100 ms, so each message replaces our copy and can't leave it wrong.
+  Checks in the summary:
+  - `books_ok` / `books_bad`: a book with an empty side or bid >= ask is not
+    used (`BAD BOOK` line, shown once until a good one arrives).
+  - `books_out_of_order`: a book older than the one we have, ignored.
+  - `trade_gaps` / `trades_missed`: trade ids count up by one per pair, so a
+    jump means trades we never received (`TRADE GAP` line). Ids are compared
+    within one connection only; trades missed while disconnected don't count.
+  - `top_check_ok` / `top_check_differs`: when the real-time best bid/ask
+    message and a book message carry the same update id, their tops must
+    agree. `differs` should stay at or near 0.
+  - Binance.US closes every connection after 24 hours; it reconnects by itself.
 - `ACTION MISMATCH` means replay decided something different from what live
   logged. That must never happen; if it does, the state machine depends on
   something that isn't in the log.

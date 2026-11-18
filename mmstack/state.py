@@ -48,6 +48,10 @@ class StateMachine:
         self.valid = {}  # (venue, symbol) -> bool (False until a good snapshot)
         self.last_top = {}  # (venue, symbol) -> (bid, ask) last printed
         self.cb_last_seq = None  # Coinbase sequence_num on the current connection
+        # Binance.US, per symbol, reset on every (re)connect
+        self.bn_last_id = {}  # last book lastUpdateId seen
+        self.bn_last_trade = {}  # last trade id seen
+        self.bn_ticker = {}  # latest bookTicker: (update id, bid, ask)
         self.instruments = {}  # Kraken symbol -> {"price_increment": D, "qty_min": D, ...}
         self.stats = {}
 
@@ -168,6 +172,8 @@ class StateMachine:
             self._invalidate_venue(conn)  # wait for fresh snapshots
             if conn == "coinbase":
                 self.cb_last_seq = None  # sequence numbers restart per connection
+            if conn == "binanceus":
+                self._binanceus_reset()
             out.append(self._line(f"{conn} connected"))
         elif type_ == "conn_close":
             if conn == "kraken":
@@ -177,6 +183,8 @@ class StateMachine:
             self._invalidate_venue(conn)
             if conn == "kraken_priv":
                 self.private_ready = False
+            if conn == "binanceus":
+                self._binanceus_reset()
             out.append(self._line(f"{conn} disconnected: {event['data'].get('reason', '')}"))
         elif type_ == "ws_in":
             msg = json.loads(event["data"]["text"], parse_float=Decimal)
@@ -184,6 +192,8 @@ class StateMachine:
                 self._kraken(msg, out)
             elif conn == "coinbase":
                 self._coinbase(msg, out)
+            elif conn == "binanceus":
+                self._binanceus(msg, out)
             elif conn == "kraken_priv":
                 self._kraken_private(msg, out)
         elif type_ == "session":
@@ -321,6 +331,79 @@ class StateMachine:
                 self._count("coinbase.trades", len(ev.get("trades", [])))
         elif msg.get("type") == "error":
             out.append(self._line(f"coinbase error: {msg.get('message')}"))
+
+    # ---------- Binance.US ----------
+    def _binanceus_reset(self):
+        """A new connection: ids may jump over what we missed while away."""
+        self.bn_last_id.clear()
+        self.bn_last_trade.clear()
+        self.bn_ticker.clear()
+
+    def _binanceus(self, msg, out):
+        stream = msg.get("stream")
+        if stream is None:
+            if "code" in msg or "error" in msg:
+                out.append(self._line(f"binanceus error: {msg}"))
+            return
+        data = msg.get("data") or {}
+        sym, _, kind = stream.partition("@")
+        sym = sym.upper()
+        if kind.startswith("depth"):
+            self._binanceus_book(sym, data, out)
+        elif kind == "trade":
+            self._binanceus_trade(sym, data, out)
+        elif kind == "bookTicker":
+            self._count("binanceus.tickers")
+            self.bn_ticker[sym] = (data["u"], Decimal(data["b"]), Decimal(data["a"]))
+
+    def _binanceus_book(self, sym, data, out):
+        """Each message is the whole top 20, so it replaces our copy outright:
+        no checksum needed, and a missed message can't leave the book wrong."""
+        key = ("binanceus", sym)
+        uid = data["lastUpdateId"]
+        last = self.bn_last_id.get(sym)
+        if last is not None and uid < last:
+            self._count("binanceus.books_out_of_order")  # older than what we have: ignore
+            return
+        self.bn_last_id[sym] = uid
+        book = Book()
+        for price, qty in data.get("bids", []):
+            book.bids.set(Decimal(price), Decimal(qty))
+        for price, qty in data.get("asks", []):
+            book.asks.set(Decimal(price), Decimal(qty))
+        bid, ask = book.best_bid(), book.best_ask()
+        if bid is None or ask is None or bid >= ask:
+            self._count("binanceus.books_bad")  # empty side or crossed: don't trust it
+            if self.valid.get(key):
+                out.append(self._line(f"binanceus {sym} BAD BOOK bid={bid} ask={ask} - not used"))
+            self.valid[key] = False
+            self.last_top.pop(key, None)
+            return
+        self.books[key] = book
+        self.valid[key] = True
+        self._count("binanceus.books_ok")
+        ticker = self.bn_ticker.get(sym)
+        if ticker is not None and ticker[0] == uid:  # same moment: tops must agree
+            self._count("binanceus.top_check_ok" if ticker[1:] == (bid, ask)
+                        else "binanceus.top_check_differs")
+        line = self._top_line("binanceus", sym)
+        if line:
+            out.append(line)
+
+    def _binanceus_trade(self, sym, data, out):
+        """Trade ids count up by one per symbol, so a jump means we missed trades."""
+        self._count("binanceus.trades")
+        tid = data["t"]
+        last = self.bn_last_trade.get(sym)
+        if last is not None:
+            if tid <= last:
+                self._count("binanceus.trades_repeated")
+                return
+            if tid != last + 1:
+                self._count("binanceus.trade_gaps")
+                self._count("binanceus.trades_missed", tid - last - 1)
+                out.append(self._line(f"binanceus {sym} TRADE GAP {last} -> {tid}"))
+        self.bn_last_trade[sym] = tid
 
     # ---------- Kraken private (our orders) ----------
     def _kraken_private(self, msg, out):

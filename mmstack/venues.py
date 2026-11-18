@@ -46,3 +46,28 @@ def coinbase(products):
         "path": "/",
         "subscribe": [json.dumps(s, separators=(",", ":")) for s in subs],
     }
+
+
+BINANCEUS_DEPTH = 20  # levels in each full-book message
+
+
+def binanceus(symbols):
+    """Binance.US public streams for each symbol (e.g. "BTCUSD"), on one
+    combined-stream connection (messages arrive as {"stream": ..., "data": ...};
+    the book messages don't name their symbol, the stream name does):
+      <sym>@depth20@100ms  the whole top 20 levels, every 100 ms
+      <sym>@trade          every trade
+      <sym>@bookTicker     best bid/ask on every change (used as a cross-check)
+    The streams are chosen in the URL, so nothing is sent after connecting.
+    """
+    streams = []
+    for sym in symbols:
+        low = sym.lower()
+        streams += [f"{low}@depth{BINANCEUS_DEPTH}@100ms", f"{low}@trade", f"{low}@bookTicker"]
+    return {
+        "name": "binanceus",
+        "host": "stream.binance.us",
+        "port": 9443,
+        "path": "/stream?streams=" + "/".join(streams),
+        "subscribe": [],
+    }
