@@ -297,7 +297,9 @@ def paper_config(args):
             "rate_tier": args.mm_rate_tier,
             "alarm_bps": args.mm_alarm_bps,
             "alarm_window_ms": args.mm_alarm_window_ms,
-            "alarm_hold_ms": args.mm_alarm_hold_ms}
+            "alarm_hold_ms": args.mm_alarm_hold_ms,
+            "alarm_vol": args.mm_alarm_vol,
+            "alarm_vol_tau_s": args.mm_alarm_vol_tau_s}
 
 
 def add_paper_args(p):
@@ -323,6 +325,11 @@ def add_paper_args(p):
                    help="...within this many ms (default 100)")
     p.add_argument("--mm-alarm-hold-ms", type=int, default=1000,
                    help="...and keep that side off this long (default 1000)")
+    p.add_argument("--mm-alarm-vol", default="0", metavar="K",
+                   help="volatility alarm: ring when Coinbase moves K times its normal move "
+                        "per window (0 = off, default). --mm-alarm-bps then sets a floor")
+    p.add_argument("--mm-alarm-vol-tau-s", type=int, default=600,
+                   help="...where 'normal' is averaged over about this many seconds (default 600)")
     p.add_argument("--mm-rate-tier", choices=("none", "starter", "intermediate", "pro"),
                    default="intermediate",
                    help="obey Kraken's order rate limit for this account level "

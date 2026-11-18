@@ -77,6 +77,7 @@ MAX_CANCEL_COST = Decimal(8)  # room we keep per resting order so it can always 
 REF_TAU_NS = 60_000_000_000  # the "normal gap" to the reference price averages over ~60 s
 REF_UPDATE_NS = 1_000_000_000  # ...and is updated once a second
 REF_STALE_NS = 2_000_000_000  # ignore a reference price older than this
+VOL_WARMUP_NS = 60_000_000_000  # volatility alarm stays silent for its first 60 s of data
 CANCEL_COST_BY_AGE = ((5, 8), (10, 6), (15, 5), (45, 4), (90, 2), (300, 1))  # (age < s, points)
 
 
@@ -164,7 +165,8 @@ class PaperMarketMaker:
     def __init__(self, symbol, spread=Decimal("0.0005"), max_inv_multiple=5,
                  requote=Decimal("0.1"), latency_ns=150_000_000, stale_ns=10_000_000_000,
                  size=None, fills="queue", skew=True, ref_weight=Decimal(0), rate_tier=None,
-                 alarm_bps=Decimal(0), alarm_window_ns=100_000_000, alarm_hold_ns=1_000_000_000):
+                 alarm_bps=Decimal(0), alarm_window_ns=100_000_000, alarm_hold_ns=1_000_000_000,
+                 alarm_vol=Decimal(0), alarm_vol_tau_ns=600_000_000_000):
         if fills not in ("queue", "through"):
             raise ValueError(f"fills must be 'queue' or 'through', not {fills!r}")
         self.symbol = symbol
@@ -180,7 +182,10 @@ class PaperMarketMaker:
         if rate_tier not in (None, "none") and rate_tier not in RATE_TIERS:
             raise ValueError(f"unknown rate tier {rate_tier!r}")
         self.rate_tier = None if rate_tier in (None, "none") else rate_tier
-        self.alarm_bps = Decimal(alarm_bps)  # 0 = alarm off
+        self.alarm_bps = Decimal(alarm_bps)  # fixed jump size; with alarm_vol it is the floor
+        self.alarm_vol = Decimal(alarm_vol)  # jump size in units of Coinbase's normal move
+        self.alarm_vol_tau_ns = alarm_vol_tau_ns
+        self.alarm_on = bool(self.alarm_bps or self.alarm_vol)
         self.alarm_window_ns = alarm_window_ns
         self.alarm_hold_ns = alarm_hold_ns
 
@@ -217,6 +222,12 @@ class PaperMarketMaker:
         self.alarm_until = {"bid": 0, "ask": 0}  # that side stays off until this time
         self.alarm_off_ns = {"bid": 0, "ask": 0}
         self.stats.update({"alarms_up": 0, "alarms_down": 0, "alarm_fills": 0})
+        # volatility alarm: running average of the squared move per alarm window (bps^2)
+        self.vol_var = None
+        self._vol_t = None  # start of the current window on the move grid
+        self._vol_p = None  # reference price at that start
+        self._vol_seen_ns = 0  # how much data the average is built on
+        self._thr = {"n": 0, "sum": Decimal(0), "min": None, "max": None}
 
     # kept for convenience (and tests)
     @property
@@ -323,7 +334,7 @@ class PaperMarketMaker:
 
     def on_reference(self, now, ref_mid):
         """The other exchange's mid changed (None = its book can't be trusted)."""
-        if not self.ref_weight and not self.alarm_bps:
+        if not self.ref_weight and not self.alarm_on:
             return []  # both off: behave exactly as if Coinbase weren't there
         self._advance(now)
         self.ref_mid = ref_mid
@@ -332,27 +343,72 @@ class PaperMarketMaker:
         if ref_mid is None:
             self.ref_gap = self._gap_t = None  # start the average again when it comes back
             self._ref_hist.clear()  # a jump across an outage is not a jump
-        elif self.alarm_bps:
+            self._vol_t = self._vol_p = None  # ...and not a move for the average
+        elif self.alarm_on:
             fired = self._check_alarm(now, ref_mid)
+            if self.alarm_vol:
+                self._update_vol(now, ref_mid)  # after the check: a jump never raises its own bar
         # with only the alarm on, Coinbase ticks must not cause extra re-quotes
         if (self.ref_weight or fired) and self.book_ok and not self.pulled:
             self._quote(now, self._book)
         return []
 
+    def alarm_threshold(self):
+        """Jump size in bps that rings the alarm, or None while the volatility
+        alarm is still warming up. Fixed mode: alarm_bps. Volatility mode:
+        alarm_vol x the normal move per window, never below alarm_bps."""
+        if not self.alarm_vol:
+            return self.alarm_bps
+        if self.vol_var is None or self._vol_seen_ns < VOL_WARMUP_NS:
+            return None
+        return max(self.alarm_vol * self.vol_var.sqrt(), self.alarm_bps)
+
+    def _update_vol(self, now, ref_mid):
+        """Average of the squared Coinbase move per alarm window, over ~tau.
+        A quiet gap of n windows counts as n windows sharing the move."""
+        if self._vol_t is None:
+            self._vol_t, self._vol_p = now, ref_mid
+            return
+        span = now - self._vol_t
+        if span < self.alarm_window_ns:
+            return
+        n = span // self.alarm_window_ns
+        step = n * self.alarm_window_ns
+        r = (ref_mid - self._vol_p) / self._vol_p * BPS
+        sample = r * r / n
+        if self.vol_var is None:
+            self.vol_var = sample
+        else:
+            self.vol_var += (sample - self.vol_var) * step / (self.alarm_vol_tau_ns + step)
+        self._vol_seen_ns += step
+        self._vol_t += step
+        self._vol_p = ref_mid
+
     def _check_alarm(self, now, ref_mid):
-        """Has the reference price jumped alarm_bps or more within the window?
-        Up: our ask is about to be bought too cheaply, so it comes off.
+        """Has the reference price jumped the alarm threshold or more within the
+        window? Up: our ask is about to be bought too cheaply, so it comes off.
         Down: the bid comes off. Returns True if an alarm fired."""
         hist = self._ref_hist
         while hist and now - hist[0][0] > self.alarm_window_ns:
             hist.popleft()
         fired = False
-        if hist:
+        thr = self.alarm_threshold()
+        if thr is not None and self.alarm_vol:
+            t = self._thr
+            t["n"] += 1
+            t["sum"] += thr
+            t["min"] = thr if t["min"] is None else min(t["min"], thr)
+            t["max"] = thr if t["max"] is None else max(t["max"], thr)
+        if hist and thr is not None:
             low = min(p for _, p in hist)
             high = max(p for _, p in hist)
-            if (ref_mid - low) / low * BPS >= self.alarm_bps:
+            up = (ref_mid - low) / low * BPS
+            down = (high - ref_mid) / high * BPS
+            # "> 0": in a dead-flat market the volatility threshold can reach 0,
+            # and a price that has not moved is never a jump
+            if up > 0 and up >= thr:
                 fired = self._alarm(now, "ask")
-            elif (high - ref_mid) / high * BPS >= self.alarm_bps:
+            elif down > 0 and down >= thr:
                 fired = self._alarm(now, "bid")
         if fired:
             hist.clear()  # the move must go a further alarm_bps to ring again
@@ -659,10 +715,21 @@ class PaperMarketMaker:
             calcs = self.stats["quote_calcs"]
             used = f"{Decimal(self.stats['quotes_with_ref']) / calcs * 100:.0f}%" if calcs else "n/a"
             lines.append(f"summary paper {s} coinbase_signal weight={self.ref_weight} used={used}")
-        if self.alarm_bps:
+        if self.alarm_on:
             off = {side: (Decimal(ns) / total_ns * 100) if total_ns else Decimal(0)
                    for side, ns in self.alarm_off_ns.items()}
-            lines.append(f"summary paper {s} coinbase_alarm jump>={self.alarm_bps}bps "
+            if self.alarm_vol:
+                t = self._thr
+                if t["n"]:
+                    level = (f"(avg {t['sum'] / t['n']:.2f}bps min {t['min']:.2f} "
+                             f"max {t['max']:.2f})")
+                else:
+                    level = "(never warmed up)"
+                jump = (f"jump>={self.alarm_vol}x_normal_move {level}"
+                        + (f" floor={self.alarm_bps}bps" if self.alarm_bps else ""))
+            else:
+                jump = f"jump>={self.alarm_bps}bps"
+            lines.append(f"summary paper {s} coinbase_alarm {jump} "
                          f"within={self.alarm_window_ns // 1_000_000}ms "
                          f"hold={self.alarm_hold_ns // 1_000_000}ms "
                          f"alarms up={self.stats['alarms_up']} down={self.stats['alarms_down']} "

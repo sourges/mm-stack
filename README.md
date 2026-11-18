@@ -104,6 +104,8 @@ python -m mmstack.main live --paper-mm --data-dir E:\mmdata          (records th
 | `--mm-alarm-bps` | `0` | Coinbase alarm: take one side off after Coinbase jumps this many bps (`0` = off, `2` = suggested) |
 | `--mm-alarm-window-ms` | `100` | ...within this many ms |
 | `--mm-alarm-hold-ms` | `1000` | ...and keep that side off this long |
+| `--mm-alarm-vol` | `0` | Volatility alarm: ring when Coinbase moves K times its normal move per window (`0` = off). `--mm-alarm-bps` then sets a floor |
+| `--mm-alarm-vol-tau-s` | `600` | ...where "normal" is averaged over about this many seconds |
 | `--mm-rate-tier` | `intermediate` | obey Kraken's order rate limit for this account level (`starter`, `intermediate`, `pro`); `none` = only measure it |
 
 How it works:
@@ -140,6 +142,14 @@ How it works:
   cancel takes the usual latency, so the quote can still be hit first;
   `fills_during_alarm` in the summary counts those. `bid_off` / `ask_off` are
   the share of time each side was held off.
+- **Volatility alarm** (`--mm-alarm-vol K`). Same alarm, but the jump size
+  adapts: it rings when Coinbase moves K times its normal move per window.
+  "Normal" is the root-mean-square Coinbase move per 100 ms window, averaged
+  over about 10 minutes (`--mm-alarm-vol-tau-s`). It stays silent for its
+  first 60 s of data, a jump is checked before it is added to the average,
+  and a price that hasn't moved never rings. Add `--mm-alarm-bps` as a floor
+  (useful on pairs where one price tick is already a big move, like LINK).
+  The summary shows the average, lowest and highest jump size it used.
 - **Kraken's rate limit** (`--mm-rate-tier`). The bot keeps Kraken's per-pair
   rate counter itself (new order +1; cancel +8 if the order is under 5 s old,
   less as it ages; decays every second). It holds back any new order or

@@ -84,7 +84,9 @@ class StateMachine:
                                   rate_tier=cfg.get("rate_tier", "none"),
                                   alarm_bps=Decimal(str(cfg.get("alarm_bps", "0"))),
                                   alarm_window_ns=int(cfg.get("alarm_window_ms", 100)) * 1_000_000,
-                                  alarm_hold_ns=int(cfg.get("alarm_hold_ms", 1000)) * 1_000_000)
+                                  alarm_hold_ns=int(cfg.get("alarm_hold_ms", 1000)) * 1_000_000,
+                                  alarm_vol=Decimal(str(cfg.get("alarm_vol", "0"))),
+                                  alarm_vol_tau_ns=int(cfg.get("alarm_vol_tau_s", 600)) * 1_000_000_000)
             if sym in self.instruments:
                 mm.set_instrument(self.instruments[sym])
             self.paper[sym] = mm
@@ -411,6 +413,19 @@ class StateMachine:
                 out.append(self._line("TEST ORDER WARNING: it filled - check your Kraken balance"))
 
     # ---------- end of run ----------
+    @staticmethod
+    def _alarm_setting(cfg):
+        """The alarm part of the paper settings line ('' when the alarm is off)."""
+        bps = Decimal(str(cfg.get("alarm_bps", "0")))
+        vol = Decimal(str(cfg.get("alarm_vol", "0")))
+        timing = f"/{cfg.get('alarm_window_ms', 100)}ms/{cfg.get('alarm_hold_ms', 1000)}ms"
+        if vol:
+            return (f" alarm={vol}x_normal_move{timing} avg_over={cfg.get('alarm_vol_tau_s', 600)}s"
+                    + (f" floor={bps}bps" if bps else ""))
+        if bps:
+            return f" alarm={cfg['alarm_bps']}bps{timing}"
+        return ""
+
     def summary(self):
         lines = [f"summary {k}={self.stats[k]}" for k in sorted(self.stats)]
         if self._expected:
@@ -426,9 +441,7 @@ class StateMachine:
                          f"fills={cfg.get('fills', 'queue')} "
                          f"skew={'on' if cfg.get('skew', True) else 'off'} "
                          f"coinbase={cfg.get('coinbase', '0')} rate_limit={cfg.get('rate_tier', 'none')}"
-                         + (f" alarm={cfg['alarm_bps']}bps/{cfg.get('alarm_window_ms', 100)}ms"
-                            f"/{cfg.get('alarm_hold_ms', 1000)}ms"
-                            if Decimal(str(cfg.get("alarm_bps", "0"))) else ""))
+                         + self._alarm_setting(cfg))
             for sym in sorted(self.paper):
                 lines.extend(self.paper[sym].summary_lines(total))
         return lines
