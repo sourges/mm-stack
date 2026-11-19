@@ -290,7 +290,7 @@ def paper_config(args):
     """Step 10 paper market maker settings from the command line (or None)."""
     if not getattr(args, "paper_mm", None):
         return None
-    return {"symbols": _split(args.paper_mm),
+    cfg = {"symbols": _split(args.paper_mm),
             "spread": str(Decimal(args.mm_spread) / 100),  # 0.05 (%) -> "0.0005"
             "max_inv": args.mm_max_inv,
             "requote": args.mm_requote,
@@ -304,6 +304,9 @@ def paper_config(args):
             "alarm_hold_ms": args.mm_alarm_hold_ms,
             "alarm_vol": args.mm_alarm_vol,
             "alarm_vol_tau_s": args.mm_alarm_vol_tau_s}
+    if args.mm_venue != "kraken":
+        cfg["venue"] = args.mm_venue  # only written when used, so older settings stay as they were
+    return cfg
 
 
 def add_paper_args(p):
@@ -334,6 +337,9 @@ def add_paper_args(p):
                         "per window (0 = off, default). --mm-alarm-bps then sets a floor")
     p.add_argument("--mm-alarm-vol-tau-s", type=int, default=600,
                    help="...where 'normal' is averaged over about this many seconds (default 600)")
+    p.add_argument("--mm-venue", choices=("kraken", "binanceus"), default="kraken",
+                   help="whose book and trades to quote on (default kraken). binanceus: "
+                        "Binance.US's top-20 book; Kraken's rate limit doesn't apply there")
     p.add_argument("--mm-rate-tier", choices=("none", "starter", "intermediate", "pro"),
                    default="intermediate",
                    help="obey Kraken's order rate limit for this account level "

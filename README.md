@@ -107,6 +107,7 @@ python -m mmstack.main live --paper-mm --data-dir E:\mmdata          (records th
 | `--mm-alarm-hold-ms` | `1000` | ...and keep that side off this long |
 | `--mm-alarm-vol` | `0` | Volatility alarm: ring when Coinbase moves K times its normal move per window (`0` = off). `--mm-alarm-bps` then sets a floor |
 | `--mm-alarm-vol-tau-s` | `600` | ...where "normal" is averaged over about this many seconds |
+| `--mm-venue` | `kraken` | Whose book and trades to quote on: `kraken` or `binanceus` |
 | `--mm-rate-tier` | `intermediate` | obey Kraken's order rate limit for this account level (`starter`, `intermediate`, `pro`); `none` = only measure it |
 
 How it works:
@@ -151,6 +152,15 @@ How it works:
   and a price that hasn't moved never rings. Add `--mm-alarm-bps` as a floor
   (useful on pairs where one price tick is already a big move, like LINK).
   The summary shows the average, lowest and highest jump size it used.
+- **Quoting on Binance.US** (`--mm-venue binanceus`). Same market maker, fed
+  Binance.US's top-20 book and its trades instead of Kraken's (Coinbase stays
+  the reference for the alarm). Differences: queues are visible down to
+  level 20; the price tick is read off the book's prices (Binance.US's
+  exchange info isn't recorded); order size is about $5; Kraken's rate limit
+  is not applied and Binance.US's isn't modeled (`rate_limit not modeled` in
+  the summary). Fees: Binance.US maker is 0%, so read the `fee0.00%` column.
+  Binance.US books come every 100 ms at most, so queue tracking is coarser
+  than on Kraken. Needs a log recorded with Binance.US (Nov 18, 2026 on).
 - **Kraken's rate limit** (`--mm-rate-tier`). The bot keeps Kraken's per-pair
   rate counter itself (new order +1; cancel +8 if the order is under 5 s old,
   less as it ages; decays every second). It holds back any new order or

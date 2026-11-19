@@ -135,11 +135,12 @@ def tick_from_prices(prices):
     return Decimal(1).scaleb(-places)
 
 
-def level_visible(side, price):
-    """Can we see this price level in the recorded book (top 10 levels)?"""
-    if price in side.levels or len(side) < KRAKEN_BOOK_DEPTH:
+def level_visible(side, price, depth=KRAKEN_BOOK_DEPTH):
+    """Can we see this price level in the recorded book (top `depth` levels:
+    10 on Kraken, 20 on Binance.US)?"""
+    if price in side.levels or len(side) < depth:
         return True
-    worst = side.top(KRAKEN_BOOK_DEPTH)[-1][0]
+    worst = side.top(depth)[-1][0]
     return price >= worst if side.is_bid else price <= worst
 
 
@@ -166,7 +167,8 @@ class PaperMarketMaker:
                  requote=Decimal("0.1"), latency_ns=150_000_000, stale_ns=10_000_000_000,
                  size=None, fills="queue", skew=True, ref_weight=Decimal(0), rate_tier=None,
                  alarm_bps=Decimal(0), alarm_window_ns=100_000_000, alarm_hold_ns=1_000_000_000,
-                 alarm_vol=Decimal(0), alarm_vol_tau_ns=600_000_000_000):
+                 alarm_vol=Decimal(0), alarm_vol_tau_ns=600_000_000_000,
+                 book_depth=KRAKEN_BOOK_DEPTH, kraken_limits=True):
         if fills not in ("queue", "through"):
             raise ValueError(f"fills must be 'queue' or 'through', not {fills!r}")
         self.symbol = symbol
@@ -185,6 +187,8 @@ class PaperMarketMaker:
         self.alarm_bps = Decimal(alarm_bps)  # fixed jump size; with alarm_vol it is the floor
         self.alarm_vol = Decimal(alarm_vol)  # jump size in units of Coinbase's normal move
         self.alarm_vol_tau_ns = alarm_vol_tau_ns
+        self.book_depth = book_depth  # levels the recorded book shows
+        self.kraken_limits = kraken_limits  # False on Binance.US: Kraken's rate counter means nothing there
         self.alarm_on = bool(self.alarm_bps or self.alarm_vol)
         self.alarm_window_ns = alarm_window_ns
         self.alarm_hold_ns = alarm_hold_ns
@@ -460,7 +464,7 @@ class PaperMarketMaker:
             if q is None or q.checked or now < q.live_at:
                 continue
             q.checked = True
-            if level_visible(book_side, q.price):
+            if level_visible(book_side, q.price, self.book_depth):
                 q.level_size = book_side.levels.get(q.price, Decimal(0))
                 q.ahead = q.level_size
                 self.stats["queue_seen"] += 1
@@ -472,7 +476,7 @@ class PaperMarketMaker:
             q = self.cur[side]
             if q is None or not q.checked:
                 continue
-            if not level_visible(book_side, q.price):
+            if not level_visible(book_side, q.price, self.book_depth):
                 q.level_size = None  # out of view: we can't see what happens there
                 continue
             new = book_side.levels.get(q.price, Decimal(0))
@@ -704,8 +708,12 @@ class PaperMarketMaker:
         blocked = " ".join(
             f"{name}={(Decimal(c.blocked) / c.actions * 100) if c.actions else Decimal(0):.1f}%"
             for name, c in self.rate.items())
-        lines.append(f"summary paper {s} rate_limit_blocked {blocked} "
-                     f"(order actions={self.stats['places'] + self.stats['cancels']})")
+        if self.kraken_limits:
+            lines.append(f"summary paper {s} rate_limit_blocked {blocked} "
+                         f"(order actions={self.stats['places'] + self.stats['cancels']})")
+        else:
+            lines.append(f"summary paper {s} rate_limit not modeled "
+                         f"(order actions={self.stats['places'] + self.stats['cancels']})")
         if self.rate_tier is not None:
             lines.append(f"summary paper {s} rate_limit enforced={self.rate_tier} "
                          f"held_back={self.stats['held_back']} "

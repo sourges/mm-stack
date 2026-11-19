@@ -79,7 +79,7 @@ class TestBook(Feed):
         self.assertTrue(self.valid())
         self.assertEqual((self.book().best_bid(), self.book().best_ask()), (D("64000.10"), D("64001.00")))
         self.assertEqual(self.book().bids.top(2), [(D("64000.10"), D("0.5")), (D("63999.00"), D("1.2"))])
-        self.assertIn("binanceus BTCUSD bid=64000.10 ask=64001.00 mid=64000.55", out[0]["text"]
+        self.assertIn("binanceus BTCUSD bid=64000.1 ask=64001 mid=64000.55", out[0]["text"]
                       if isinstance(out[0], dict) else out[0])
         self.assertEqual(self.stat("books_ok"), 1)
 
@@ -108,7 +108,7 @@ class TestBook(Feed):
         out = self.send(depth("BTCUSD", 101, [("64002.00", "1")], [("64001.00", "1")]))
         self.assertFalse(self.valid())
         self.assertEqual(self.stat("books_bad"), 1)
-        self.assertTrue(any("BTCUSD BAD BOOK bid=64002.00 ask=64001.00" in str(x) for x in out))
+        self.assertTrue(any("BTCUSD BAD BOOK bid=64002 ask=64001" in str(x) for x in out))
         self.assertTrue(any(is_important(str(x)) for x in out))
         self.assertEqual(self.book().best_bid(), D("64000.10"))  # the old copy is kept, but not trusted
 
@@ -135,7 +135,7 @@ class TestBook(Feed):
         self.send(depth("BTCUSD", 100, [("1", "1")], []))
         out = self.send(depth("BTCUSD", 101, *BOOK))
         self.assertTrue(self.valid())
-        self.assertTrue(any("bid=64000.10" in str(x) for x in out))
+        self.assertTrue(any("bid=64000.1 " in str(x) for x in out))
 
     def test_symbols_are_separate(self):
         self.send(depth("BTCUSD", 100, *BOOK))

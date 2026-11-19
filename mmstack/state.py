@@ -21,7 +21,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from .books import Book, kraken_checksum
 from .paper_mm import PaperMarketMaker
-from .venues import KRAKEN_BOOK_DEPTH
+from .venues import BINANCEUS_DEPTH, KRAKEN_BOOK_DEPTH
 
 TEST_ORDER_DISCOUNT = Decimal("0.05")  # test buy sits 5% below the best bid
 TEST_ORDER_HOLD_NS = 5_000_000_000  # cancel 5 s after Kraken confirms it
@@ -32,6 +32,14 @@ def iso(t_ns):
     sec, ns = divmod(t_ns, 1_000_000_000)
     dt = datetime.fromtimestamp(sec, tz=timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{ns // 1000:06d}Z"
+
+
+def bn_decimal(text):
+    """Binance.US pads numbers ("62310.42000000"); drop the padding so prices
+    print cleanly and the price tick can be read off them (0.01, not 1e-8)."""
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return Decimal(text)
 
 
 def round_to(value, increment, rounding):
@@ -72,11 +80,14 @@ class StateMachine:
         # step 10 (paper): {"symbols": [...], "spread": "0.0005", ...} or None
         self.paper_config = None
         self.paper = {}  # symbol -> PaperMarketMaker
+        self.paper_venue = "kraken"
         if paper_mm:
             self._enable_paper(paper_mm)
 
     def _enable_paper(self, cfg):
         self.paper_config = cfg
+        self.paper_venue = cfg.get("venue", "kraken")  # whose book and trades we quote on
+        on_binance = self.paper_venue == "binanceus"
         for sym in cfg["symbols"]:
             mm = PaperMarketMaker(sym, spread=Decimal(cfg["spread"]),
                                   max_inv_multiple=Decimal(str(cfg.get("max_inv", 5))),
@@ -85,13 +96,15 @@ class StateMachine:
                                   fills=cfg.get("fills", "queue"),
                                   skew=cfg.get("skew", True),
                                   ref_weight=Decimal(str(cfg.get("coinbase", "0"))),
-                                  rate_tier=cfg.get("rate_tier", "none"),
+                                  rate_tier=None if on_binance else cfg.get("rate_tier", "none"),
                                   alarm_bps=Decimal(str(cfg.get("alarm_bps", "0"))),
                                   alarm_window_ns=int(cfg.get("alarm_window_ms", 100)) * 1_000_000,
                                   alarm_hold_ns=int(cfg.get("alarm_hold_ms", 1000)) * 1_000_000,
                                   alarm_vol=Decimal(str(cfg.get("alarm_vol", "0"))),
-                                  alarm_vol_tau_ns=int(cfg.get("alarm_vol_tau_s", 600)) * 1_000_000_000)
-            if sym in self.instruments:
+                                  alarm_vol_tau_ns=int(cfg.get("alarm_vol_tau_s", 600)) * 1_000_000_000,
+                                  book_depth=BINANCEUS_DEPTH if on_binance else KRAKEN_BOOK_DEPTH,
+                                  kraken_limits=not on_binance)
+            if sym in self.instruments and not on_binance:
                 mm.set_instrument(self.instruments[sym])
             self.paper[sym] = mm
 
@@ -164,7 +177,7 @@ class StateMachine:
         if type_ == "conn_open":
             self.conns[conn] = "connecting"
         elif type_ == "ws_open":
-            if conn == "kraken":
+            if conn == self.paper_venue:
                 for mm in self.paper.values():
                     out.extend(self._paper_lines(mm.on_disconnect(self.now)))
             self.conns[conn] = "open"
@@ -176,7 +189,7 @@ class StateMachine:
                 self._binanceus_reset()
             out.append(self._line(f"{conn} connected"))
         elif type_ == "conn_close":
-            if conn == "kraken":
+            if conn == self.paper_venue:
                 for mm in self.paper.values():
                     out.extend(self._paper_lines(mm.on_disconnect(self.now)))
             self.conns[conn] = "closed"
@@ -261,18 +274,18 @@ class StateMachine:
                     self.last_top.pop(key, None)
                     out.append(self._line(f"kraken {symbol} CHECKSUM MISMATCH - reconnecting"))
                     self._request_reconnect(out, "kraken", f"checksum mismatch {symbol}")
-                    if symbol in self.paper:
+                    if symbol in self.paper and self.paper_venue == "kraken":
                         out.extend(self._paper_lines(self.paper[symbol].on_book(self.now, book, False)))
                     continue
                 self._count("kraken.checksum_ok")
                 line = self._top_line("kraken", symbol)
                 if line:
                     out.append(line)
-                if symbol in self.paper:
+                if symbol in self.paper and self.paper_venue == "kraken":
                     out.extend(self._paper_lines(self.paper[symbol].on_book(self.now, book, True)))
         elif channel == "trade":
             self._count("kraken.trades", len(msg.get("data", [])))
-            if msg.get("type") == "update":  # never the snapshot of old trades
+            if msg.get("type") == "update" and self.paper_venue == "kraken":  # never old trades
                 for tr in msg.get("data", []):
                     mm = self.paper.get(tr.get("symbol"))
                     if mm:
@@ -283,7 +296,7 @@ class StateMachine:
                 self.instruments[pair["symbol"]] = {
                     k: pair.get(k) for k in ("price_increment", "qty_increment", "qty_min",
                                              "cost_min", "status")}
-                if pair["symbol"] in self.paper:
+                if pair["symbol"] in self.paper and self.paper_venue == "kraken":
                     self.paper[pair["symbol"]].set_instrument(self.instruments[pair["symbol"]])
         elif msg.get("method") == "subscribe" and msg.get("success") is False:
             out.append(self._line(f"kraken subscribe error: {msg.get('error')}"))
@@ -354,7 +367,14 @@ class StateMachine:
             self._binanceus_trade(sym, data, out)
         elif kind == "bookTicker":
             self._count("binanceus.tickers")
-            self.bn_ticker[sym] = (data["u"], Decimal(data["b"]), Decimal(data["a"]))
+            self.bn_ticker[sym] = (data["u"], bn_decimal(data["b"]), bn_decimal(data["a"]))
+
+    def _bn_paper(self, sym):
+        """The paper market maker quoting this Binance.US pair, if any
+        (BTCUSD -> the BTC/USD one), only when quoting on Binance.US."""
+        if self.paper_venue != "binanceus" or not sym.endswith("USD"):
+            return None
+        return self.paper.get(sym[:-3] + "/USD")
 
     def _binanceus_book(self, sym, data, out):
         """Each message is the whole top 20, so it replaces our copy outright:
@@ -368,9 +388,10 @@ class StateMachine:
         self.bn_last_id[sym] = uid
         book = Book()
         for price, qty in data.get("bids", []):
-            book.bids.set(Decimal(price), Decimal(qty))
+            book.bids.set(bn_decimal(price), bn_decimal(qty))
         for price, qty in data.get("asks", []):
-            book.asks.set(Decimal(price), Decimal(qty))
+            book.asks.set(bn_decimal(price), bn_decimal(qty))
+        mm = self._bn_paper(sym)
         bid, ask = book.best_bid(), book.best_ask()
         if bid is None or ask is None or bid >= ask:
             self._count("binanceus.books_bad")  # empty side or crossed: don't trust it
@@ -378,6 +399,8 @@ class StateMachine:
                 out.append(self._line(f"binanceus {sym} BAD BOOK bid={bid} ask={ask} - not used"))
             self.valid[key] = False
             self.last_top.pop(key, None)
+            if mm is not None:
+                out.extend(self._paper_lines(mm.on_book(self.now, book, False)))
             return
         self.books[key] = book
         self.valid[key] = True
@@ -389,6 +412,8 @@ class StateMachine:
         line = self._top_line("binanceus", sym)
         if line:
             out.append(line)
+        if mm is not None:
+            out.extend(self._paper_lines(mm.on_book(self.now, book, True)))
 
     def _binanceus_trade(self, sym, data, out):
         """Trade ids count up by one per symbol, so a jump means we missed trades."""
@@ -404,6 +429,12 @@ class StateMachine:
                 self._count("binanceus.trades_missed", tid - last - 1)
                 out.append(self._line(f"binanceus {sym} TRADE GAP {last} -> {tid}"))
         self.bn_last_trade[sym] = tid
+        mm = self._bn_paper(sym)
+        if mm is not None:
+            # "m" = the buyer was the maker, so the taker sold
+            side = "sell" if data["m"] else "buy"
+            out.extend(self._paper_lines(mm.on_trade(self.now, side, bn_decimal(data["p"]),
+                                                     bn_decimal(data["q"]))))
 
     # ---------- Kraken private (our orders) ----------
     def _kraken_private(self, msg, out):
@@ -523,7 +554,10 @@ class StateMachine:
                          f"latency={cfg.get('latency_ms', 150)}ms "
                          f"fills={cfg.get('fills', 'queue')} "
                          f"skew={'on' if cfg.get('skew', True) else 'off'} "
-                         f"coinbase={cfg.get('coinbase', '0')} rate_limit={cfg.get('rate_tier', 'none')}"
+                         f"coinbase={cfg.get('coinbase', '0')} "
+                         + (f"venue=binanceus rate_limit=not_modeled"
+                            if self.paper_venue == "binanceus"
+                            else f"rate_limit={cfg.get('rate_tier', 'none')}")
                          + self._alarm_setting(cfg))
             for sym in sorted(self.paper):
                 lines.extend(self.paper[sym].summary_lines(total))
