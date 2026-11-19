@@ -202,6 +202,29 @@ Samples both BTC mids every 50 ms (by our receive time) and prints:
 
 Options: `--kraken LINK/USD --coinbase LINK-USD`, `--jump-bps 1`, `--step-ms 50`.
 
+## Research: does the order book's lean predict the next move?
+
+```
+python -m mmstack.main imbalance E:\mmdata\20261118-171702.jsonl.gz --out imbalance.txt
+```
+
+The test of the VisualHFT 2026 paper on our own logs, for Kraken BTC/USD and
+LINK/USD and Binance.US BTCUSD and LINKUSD (`--kraken` / `--binanceus` to
+change, `''` for none). After every mid-price change it reads the book and
+checks which way the next change goes:
+
+- `touch`: best bid size vs best ask size; `weighted`: the paper's form over
+  the top 10 levels (`--levels`), deeper levels count less.
+- `hit` = share of calls that pointed the right way; `base` = what a reading
+  with no information would score; `diff` = hit - base, the real signal.
+- Split by spread (in ticks) and by how soon the next change came. The
+  `150 ms+` line is what a bot at our speed could use.
+- `mid move signed by the reading`: the average move in its direction, at the
+  next change and after 1 s and 5 s, in bps. Compare with our quote distance
+  (5 bps at the default spread): a real but tiny move doesn't help us.
+- No error bars: events overlap and cluster. Trust a result only if it shows
+  up on several logs.
+
 ## Step 5: the test order
 
 ### 1. Kraken API key (new key, just for mm-stack)

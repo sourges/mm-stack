@@ -348,6 +348,19 @@ def add_paper_args(p):
                    help="baseline: no inventory skew (the max-inventory cap stays on)")
 
 
+def run_imbalance(args):
+    from . import imbalance
+    keys = [("kraken", s) for s in _split(args.kraken)] + [("binanceus", s) for s in _split(args.binanceus)]
+    tailer = EventTailer(args.log)
+    data = imbalance.collect(tailer, keys, levels=args.levels)
+    tailer.close()
+    out = Output(args.out)
+    for key in keys:
+        for line in imbalance.report(f"{key[0]} {key[1]}", data[key]):
+            out.emit(line)
+    out.close()
+
+
 def run_leadlag(args):
     from . import leadlag
     pairs = {f"kraken {args.kraken}": ("kraken", args.kraken),
@@ -414,6 +427,14 @@ def main(argv=None):
     ll.add_argument("--jump-bps", default="2", help="size of a 'jump' in the event study (default 2)")
     ll.add_argument("--out", help="also write the report to this file")
     ll.set_defaults(func=run_leadlag)
+
+    im = sub.add_parser("imbalance", help="research: does the book's lean predict the next mid move?")
+    im.add_argument("log")
+    im.add_argument("--kraken", default="BTC/USD,LINK/USD", help="Kraken books to test ('' = none)")
+    im.add_argument("--binanceus", default="BTCUSD,LINKUSD", help="Binance.US books to test ('' = none)")
+    im.add_argument("--levels", type=int, default=10, help="levels per side in the weighted reading (default 10)")
+    im.add_argument("--out", help="also write the report to this file")
+    im.set_defaults(func=run_imbalance)
 
     args = p.parse_args(argv)
     args.func(args)
