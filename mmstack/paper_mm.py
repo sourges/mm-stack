@@ -168,7 +168,9 @@ class PaperMarketMaker:
                  size=None, fills="queue", skew=True, ref_weight=Decimal(0), rate_tier=None,
                  alarm_bps=Decimal(0), alarm_window_ns=100_000_000, alarm_hold_ns=1_000_000_000,
                  alarm_vol=Decimal(0), alarm_vol_tau_ns=600_000_000_000,
-                 book_depth=KRAKEN_BOOK_DEPTH, kraken_limits=True):
+                 book_depth=KRAKEN_BOOK_DEPTH, kraken_limits=True,
+                 imb_threshold=Decimal(0), imb_hold_ns=1_000_000_000, imb_reading="weighted",
+                 imb_levels=10, imb_bps=Decimal(5)):
         if fills not in ("queue", "through"):
             raise ValueError(f"fills must be 'queue' or 'through', not {fills!r}")
         self.symbol = symbol
@@ -189,6 +191,12 @@ class PaperMarketMaker:
         self.alarm_vol_tau_ns = alarm_vol_tau_ns
         self.book_depth = book_depth  # levels the recorded book shows
         self.kraken_limits = kraken_limits  # False on Binance.US: Kraken's rate counter means nothing there
+        # imbalance alarm: a very lopsided book takes the side it leans against off
+        self.imb_threshold = Decimal(imb_threshold)  # 0 = off
+        self.imb_hold_ns = imb_hold_ns
+        self.imb_reading = imb_reading  # "weighted" (top levels) or "touch" (best level only)
+        self.imb_levels = imb_levels
+        self.imb_bps = Decimal(imb_bps)  # "depth" reading: size within this many bps of mid
         self.alarm_on = bool(self.alarm_bps or self.alarm_vol)
         self.alarm_window_ns = alarm_window_ns
         self.alarm_hold_ns = alarm_hold_ns
@@ -226,6 +234,10 @@ class PaperMarketMaker:
         self.alarm_until = {"bid": 0, "ask": 0}  # that side stays off until this time
         self.alarm_off_ns = {"bid": 0, "ask": 0}
         self.stats.update({"alarms_up": 0, "alarms_down": 0, "alarm_fills": 0})
+        self.imb_off_ns = {"bid": 0, "ask": 0}
+        self._imb_zone = 0  # -1 / 0 / +1: where the last reading sat against the threshold
+        self.stats.update({"imb_alarms_up": 0, "imb_alarms_down": 0, "imb_readings": 0,
+                           "imb_past_threshold": 0})
         # volatility alarm: running average of the squared move per alarm window (bps^2)
         self.vol_var = None
         self._vol_t = None  # start of the current window on the move grid
@@ -296,6 +308,8 @@ class PaperMarketMaker:
         self._book = book
         self.last_book_t = now
         self._ensure_size(book)
+        if self.imb_threshold:
+            self._check_imbalance(now, book)  # before quoting, so a pulled side stays off
         if self.fill_mode == "queue":
             self._first_look(now, book)
             self._track_queues(now, book)
@@ -424,9 +438,58 @@ class PaperMarketMaker:
         old = self.alarm_until[side]
         if old <= now:  # a new alarm, not an extension of one still running
             self.stats["alarms_up" if side == "ask" else "alarms_down"] += 1
-        self.alarm_off_ns[side] += until - max(old, now)
-        self.alarm_until[side] = until
+        self.alarm_off_ns[side] += max(0, until - max(old, now))
+        self.alarm_until[side] = max(old, until)  # never shortens the other alarm's hold
         return True
+
+    def book_reading(self, book):
+        """How lopsided the book is, -1..+1, > 0 = more size waiting to buy.
+        touch: best bid size vs best ask size. weighted: the top levels, each
+        weighted 1 / (1 + d / S)^2, d = distance from its own side's best
+        price, S = the spread (at least one tick); the VisualHFT form.
+        depth: all size within imb_bps of mid on each side, unweighted (less
+        swayed by tiny "dust" orders at the best price)."""
+        if self.imb_reading == "touch":
+            bids, asks = book.bids.top(1), book.asks.top(1)
+            b, a = bids[0][1], asks[0][1]
+        elif self.imb_reading == "depth":
+            bids, asks = book.bids.top(self.book_depth), book.asks.top(self.book_depth)
+            mid = (bids[0][0] + asks[0][0]) / 2
+            lo, hi = mid * (1 - self.imb_bps / BPS), mid * (1 + self.imb_bps / BPS)
+            b = sum((q for p, q in bids if p >= lo), Decimal(0))
+            a = sum((q for p, q in asks if p <= hi), Decimal(0))
+        else:
+            bids, asks = book.bids.top(self.imb_levels), book.asks.top(self.imb_levels)
+            best_bid, best_ask = bids[0][0], asks[0][0]
+            scale = max(best_ask - best_bid, self.tick or Decimal(0))
+            if scale <= 0:
+                return Decimal(0)
+            b = sum((q / (1 + (best_bid - p) / scale) ** 2 for p, q in bids), Decimal(0))
+            a = sum((q / (1 + (p - best_ask) / scale) ** 2 for p, q in asks), Decimal(0))
+        return (b - a) / (b + a) if b + a > 0 else Decimal(0)
+
+    def _check_imbalance(self, now, book):
+        """The book has just tipped hard up (buyers about to lift our ask):
+        the ask comes off for imb_hold_ns. Just tipped hard down: the bid.
+        It rings only on the update where the lean CROSSES the threshold:
+        some books (Kraken BTC/USD) sit lopsided most of the time because of
+        a few big resting orders, and that standing lean isn't news."""
+        reading = self.book_reading(book)
+        self.stats["imb_readings"] += 1
+        zone = 1 if reading >= self.imb_threshold else -1 if reading <= -self.imb_threshold else 0
+        if zone:
+            self.stats["imb_past_threshold"] += 1
+        if zone and zone != self._imb_zone:
+            self._imb_alarm(now, "ask" if zone > 0 else "bid")
+        self._imb_zone = zone
+
+    def _imb_alarm(self, now, side):
+        until = now + self.imb_hold_ns
+        old = self.alarm_until[side]
+        if old <= now:
+            self.stats["imb_alarms_up" if side == "ask" else "imb_alarms_down"] += 1
+        self.imb_off_ns[side] += max(0, until - max(old, now))
+        self.alarm_until[side] = max(old, until)
 
     def _update_gap(self, now):
         """Slow average of the normal price gap between the two exchanges."""
@@ -723,6 +786,17 @@ class PaperMarketMaker:
             calcs = self.stats["quote_calcs"]
             used = f"{Decimal(self.stats['quotes_with_ref']) / calcs * 100:.0f}%" if calcs else "n/a"
             lines.append(f"summary paper {s} coinbase_signal weight={self.ref_weight} used={used}")
+        if self.imb_threshold:
+            ioff = {side: (Decimal(ns) / total_ns * 100) if total_ns else Decimal(0)
+                    for side, ns in self.imb_off_ns.items()}
+            n = self.stats["imb_readings"]
+            past = Decimal(self.stats["imb_past_threshold"]) / n * 100 if n else Decimal(0)
+            levels = {"touch": "", "depth": f"{self.imb_bps}bps"}.get(self.imb_reading, str(self.imb_levels))
+            lines.append(f"summary paper {s} imbalance_alarm {self.imb_reading}{levels} "
+                         f"at>={self.imb_threshold} hold={self.imb_hold_ns // 1_000_000}ms "
+                         f"alarms up={self.stats['imb_alarms_up']} down={self.stats['imb_alarms_down']} "
+                         f"bid_off={ioff['bid']:.2f}% ask_off={ioff['ask']:.2f}% "
+                         f"books_past_threshold={past:.1f}%")
         if self.alarm_on:
             off = {side: (Decimal(ns) / total_ns * 100) if total_ns else Decimal(0)
                    for side, ns in self.alarm_off_ns.items()}

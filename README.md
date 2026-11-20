@@ -109,6 +109,10 @@ python -m mmstack.main live --paper-mm --data-dir E:\mmdata          (records th
 | `--mm-alarm-vol` | `0` | Volatility alarm: ring when Coinbase moves K times its normal move per window (`0` = off). `--mm-alarm-bps` then sets a floor |
 | `--mm-alarm-vol-tau-s` | `600` | ...where "normal" is averaged over about this many seconds |
 | `--mm-venue` | `kraken` | Whose book and trades to quote on: `kraken` or `binanceus` |
+| `--mm-imb-alarm` | `0` | Imbalance alarm: when the book's lean tips past X (0..1), take the side it leans against off (`0` = off) |
+| `--mm-imb-hold-ms` | `1000` | ...for this long |
+| `--mm-imb-reading` | `weighted` | ...measured as `weighted` (top levels), `touch` (best level) or `depth` (size within `--mm-imb-bps` of mid) |
+| `--mm-imb-levels` / `--mm-imb-bps` | `10` / `5` | ...levels for weighted, window for depth |
 | `--mm-ref` | `coinbase` | Whose price the fair-price signal and the alarms watch: `coinbase` or `binance` (BTCUSDT for BTC/USD) |
 | `--mm-rate-tier` | `intermediate` | obey Kraken's order rate limit for this account level (`starter`, `intermediate`, `pro`); `none` = only measure it |
 
@@ -163,6 +167,16 @@ How it works:
   the summary). Fees: Binance.US maker is 0%, so read the `fee0.00%` column.
   Binance.US books come every 100 ms at most, so queue tracking is coarser
   than on Kraken. Needs a log recorded with Binance.US (Nov 18, 2026 on).
+- **Imbalance alarm** (`--mm-imb-alarm X`). Uses our own venue's book, not
+  another exchange. When the book's lean (-1..+1, + = more size waiting to
+  buy) tips past +X, buyers are about to lift our ask, so the ask comes off
+  for the hold time; past -X, the bid. It rings only on the update where the
+  lean crosses the threshold: Kraken BTC/USD's book sits lopsided much of the
+  time (a few big resting orders, dust at the best price), and that standing
+  lean isn't news. Shares the "side off" mechanism with the Coinbase alarm;
+  neither shortens the other's hold. The summary shows alarms, % of time
+  each side was off, and % of book updates past the threshold. Expect a lot
+  of off time on Kraken BTC at low thresholds; compare `fills` with a plain run.
 - **Kraken's rate limit** (`--mm-rate-tier`). The bot keeps Kraken's per-pair
   rate counter itself (new order +1; cancel +8 if the order is under 5 s old,
   less as it ages; decays every second). It holds back any new order or

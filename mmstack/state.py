@@ -106,7 +106,12 @@ class StateMachine:
                                   alarm_vol=Decimal(str(cfg.get("alarm_vol", "0"))),
                                   alarm_vol_tau_ns=int(cfg.get("alarm_vol_tau_s", 600)) * 1_000_000_000,
                                   book_depth=BINANCEUS_DEPTH if on_binance else KRAKEN_BOOK_DEPTH,
-                                  kraken_limits=not on_binance)
+                                  kraken_limits=not on_binance,
+                                  imb_threshold=Decimal(str(cfg.get("imb_alarm", "0"))),
+                                  imb_hold_ns=int(cfg.get("imb_hold_ms", 1000)) * 1_000_000,
+                                  imb_reading=cfg.get("imb_reading", "weighted"),
+                                  imb_levels=int(cfg.get("imb_levels", 10)),
+                                  imb_bps=Decimal(str(cfg.get("imb_bps", "5"))))
             if sym in self.instruments and not on_binance:
                 mm.set_instrument(self.instruments[sym])
             self.paper[sym] = mm
@@ -546,6 +551,15 @@ class StateMachine:
 
     # ---------- end of run ----------
     @staticmethod
+    def _imb_setting(cfg):
+        """The imbalance-alarm part of the settings line ('' when off)."""
+        if not Decimal(str(cfg.get("imb_alarm", "0"))):
+            return ""
+        reading = cfg.get("imb_reading", "weighted")
+        levels = {"touch": "", "depth": f"{cfg.get('imb_bps', '5')}bps"}.get(reading, str(cfg.get("imb_levels", 10)))
+        return f" imb_alarm={cfg['imb_alarm']}/{reading}{levels}/{cfg.get('imb_hold_ms', 1000)}ms"
+
+    @staticmethod
     def _alarm_setting(cfg):
         """The alarm part of the paper settings line ('' when the alarm is off)."""
         bps = Decimal(str(cfg.get("alarm_bps", "0")))
@@ -577,7 +591,8 @@ class StateMachine:
                             if self.paper_venue == "binanceus"
                             else f"rate_limit={cfg.get('rate_tier', 'none')}")
                          + (f" ref={self.paper_ref}" if self.paper_ref != "coinbase" else "")
-                         + self._alarm_setting(cfg))
+                         + self._alarm_setting(cfg)
+                         + self._imb_setting(cfg))
             for sym in sorted(self.paper):
                 lines.extend(self.paper[sym].summary_lines(total))
         return lines

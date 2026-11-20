@@ -312,6 +312,10 @@ def paper_config(args):
         cfg["venue"] = args.mm_venue  # only written when used, so older settings stay as they were
     if args.mm_ref != "coinbase":
         cfg["ref"] = args.mm_ref
+    if Decimal(args.mm_imb_alarm):  # only written when used
+        cfg.update({"imb_alarm": args.mm_imb_alarm, "imb_hold_ms": args.mm_imb_hold_ms,
+                    "imb_reading": args.mm_imb_reading, "imb_levels": args.mm_imb_levels,
+                    "imb_bps": args.mm_imb_bps})
     return cfg
 
 
@@ -346,6 +350,15 @@ def add_paper_args(p):
     p.add_argument("--mm-venue", choices=("kraken", "binanceus"), default="kraken",
                    help="whose book and trades to quote on (default kraken). binanceus: "
                         "Binance.US's top-20 book; Kraken's rate limit doesn't apply there")
+    p.add_argument("--mm-imb-alarm", default="0", metavar="X",
+                   help="imbalance alarm: when the book's lean reaches X (0..1) take the side it "
+                        "leans against off (0 = off, default; try 0.6, 0.8, 0.9)")
+    p.add_argument("--mm-imb-hold-ms", type=int, default=1000, help="...for this long (default 1000)")
+    p.add_argument("--mm-imb-reading", choices=("weighted", "touch", "depth"), default="weighted",
+                   help="...measured over the top levels (weighted, default), the best level only "
+                        "(touch), or all size within --mm-imb-bps of mid (depth)")
+    p.add_argument("--mm-imb-bps", default="5", help="...window for the depth reading (default 5)")
+    p.add_argument("--mm-imb-levels", type=int, default=10, help="...levels in the weighted reading (default 10)")
     p.add_argument("--mm-ref", choices=("coinbase", "binance"), default="coinbase",
                    help="whose price the fair-price signal (--mm-coinbase) and the alarms "
                         "watch (default coinbase; binance = Binance's BTCUSDT for BTC/USD)")
