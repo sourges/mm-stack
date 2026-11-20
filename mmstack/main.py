@@ -361,6 +361,41 @@ def run_imbalance(args):
     out.close()
 
 
+def run_hlwatch(args):
+    from . import hlwatch
+    address = hlwatch.check_address(args.address)
+    os.makedirs(args.data_dir, exist_ok=True)
+    path = os.path.join(args.data_dir, f"hl-{address[2:10]}-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".jsonl")
+    writer = EventWriter(path)
+    writer.write("hlwatch", "session", {"address": address, "every_s": args.every,
+                                         "fills_every_s": args.fills_every})
+    print(f"watching {address}, logging to {path} (Ctrl+C to stop)")
+    watcher = hlwatch.Watcher(address, writer, fills_every=max(1, round(args.fills_every / args.every)))
+    try:
+        hlwatch.run(watcher, args.every)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        writer.close()
+        print(f"stopped after {watcher.polls} polls; log saved: {path}")
+
+
+def run_hlreport(args):
+    from . import hlwatch
+    tailer = EventTailer(args.log)
+    events = []
+    while True:
+        batch = tailer.read_available()
+        if not batch:
+            break
+        events.extend(batch)
+    tailer.close()
+    out = Output(args.out)
+    for line in hlwatch.report(events):
+        out.emit(line)
+    out.close()
+
+
 def run_leadlag(args):
     from . import leadlag
     pairs = {f"kraken {args.kraken}": ("kraken", args.kraken),
@@ -427,6 +462,18 @@ def main(argv=None):
     ll.add_argument("--jump-bps", default="2", help="size of a 'jump' in the event study (default 2)")
     ll.add_argument("--out", help="also write the report to this file")
     ll.set_defaults(func=run_leadlag)
+
+    hw = sub.add_parser("hlwatch", help="research: log one Hyperliquid account's public orders, positions and fills")
+    hw.add_argument("address", help="the account, 0x + 40 hex digits")
+    hw.add_argument("--data-dir", default=os.path.join("data", "hl"), help="where to write the log (default data\\hl)")
+    hw.add_argument("--every", type=float, default=5.0, help="seconds between polls (default 5)")
+    hw.add_argument("--fills-every", type=float, default=60.0, help="seconds between fill checks (default 60)")
+    hw.set_defaults(func=run_hlwatch)
+
+    hr = sub.add_parser("hlreport", help="research: summarize an hlwatch log")
+    hr.add_argument("log")
+    hr.add_argument("--out", help="also write the report to this file")
+    hr.set_defaults(func=run_hlreport)
 
     im = sub.add_parser("imbalance", help="research: does the book's lean predict the next mid move?")
     im.add_argument("log")

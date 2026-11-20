@@ -202,6 +202,31 @@ Samples both BTC mids every 50 ms (by our receive time) and prints:
 
 Options: `--kraken LINK/USD --coinbase LINK-USD`, `--jump-bps 1`, `--step-ms 50`.
 
+## Research: watch a Hyperliquid market maker
+
+```
+python -m mmstack.main hlwatch 0xc42ec9d9156d9196f9a3887380ccfaaa518e4c8d --data-dir E:\mmdata\hl
+python -m mmstack.main hlreport E:\mmdata\hl\hl-c42ec9d9-20261119-201500.jsonl --out hl.txt
+```
+
+Hyperliquid publishes every account's open orders, positions and fills. `hlwatch`
+polls one address through the public info API (no key) and logs them; Ctrl+C
+stops it. Every 5 s (`--every`): open orders, positions, and the mid prices of
+the coins the account has appeared in. Every 60 s (`--fills-every`): its
+latest fills, logging only new ones. Network errors are logged and polling
+carries on.
+
+`hlreport` then shows, per coin: fills, volume, share as maker, fees per $
+(negative = it earns a rebate), realized PnL, markouts after 1 and 5 minutes
+(signed so + is good for the account), how far from mid its best quotes rest,
+how many levels and how much size it shows, its positions over time, and the
+account value from first to last poll.
+
+Limits: polling sees the resting pattern, not quotes that live for under a
+few seconds; one address may be only part of an operation (hedges elsewhere
+are invisible); markouts mix the exchange's fill time with our clock, hence
+the minute-long horizons. A busy account can make big logs, so keep them on E:.
+
 ## Research: does the order book's lean predict the next move?
 
 ```
