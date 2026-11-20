@@ -60,14 +60,25 @@ def binanceus(symbols):
       <sym>@bookTicker     best bid/ask on every change (used as a cross-check)
     The streams are chosen in the URL, so nothing is sent after connecting.
     """
+    return _binance_style("binanceus", "stream.binance.us", 9443, symbols)
+
+
+def binance(symbols):
+    """Binance (global), from its market-data-only stream (no account or key;
+    no private data is available there), e.g. "BTCUSDT". Same streams and
+    message format as Binance.US. Used as a reference price only."""
+    return _binance_style("binance", "data-stream.binance.vision", 443, symbols)
+
+
+def _binance_style(name, host, port, symbols):
     streams = []
     for sym in symbols:
         low = sym.lower()
         streams += [f"{low}@depth{BINANCEUS_DEPTH}@100ms", f"{low}@trade", f"{low}@bookTicker"]
     return {
-        "name": "binanceus",
-        "host": "stream.binance.us",
-        "port": 9443,
+        "name": name,
+        "host": host,
+        "port": port,
         "path": "/stream?streams=" + "/".join(streams),
         "subscribe": [],
     }

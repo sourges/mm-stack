@@ -129,7 +129,8 @@ def action_sink(writer, reactor):
 
 
 def build_clients(writer, kraken_symbols, coinbase_products, keys=None,
-                  private=False, trading_enabled=False, binanceus_symbols=None):
+                  private=False, trading_enabled=False, binanceus_symbols=None,
+                  binance_symbols=None):
     clients = []
     specs = []
     if kraken_symbols:
@@ -138,6 +139,8 @@ def build_clients(writer, kraken_symbols, coinbase_products, keys=None,
         specs.append(venues.coinbase(coinbase_products))
     if binanceus_symbols:
         specs.append(venues.binanceus(binanceus_symbols))
+    if binance_symbols:
+        specs.append(venues.binance(binance_symbols))
     for s in specs:
         clients.append(WsClient(s["name"], s["host"], s["port"], s["path"],
                                 s["subscribe"], writer))
@@ -165,7 +168,8 @@ def run_live(args):
                                      "paper_mm": paper_config(args)})
     clients = build_clients(writer, _split(args.kraken), _split(args.coinbase), keys=keys,
                             private=private, trading_enabled=args.enable_trading,
-                            binanceus_symbols=_split(args.binanceus))
+                            binanceus_symbols=_split(args.binanceus),
+                            binance_symbols=_split(args.binance))
     reactor = build_reactor(clients, writer)
     net_stop = threading.Event()
 
@@ -306,6 +310,8 @@ def paper_config(args):
             "alarm_vol_tau_s": args.mm_alarm_vol_tau_s}
     if args.mm_venue != "kraken":
         cfg["venue"] = args.mm_venue  # only written when used, so older settings stay as they were
+    if args.mm_ref != "coinbase":
+        cfg["ref"] = args.mm_ref
     return cfg
 
 
@@ -340,6 +346,9 @@ def add_paper_args(p):
     p.add_argument("--mm-venue", choices=("kraken", "binanceus"), default="kraken",
                    help="whose book and trades to quote on (default kraken). binanceus: "
                         "Binance.US's top-20 book; Kraken's rate limit doesn't apply there")
+    p.add_argument("--mm-ref", choices=("coinbase", "binance"), default="coinbase",
+                   help="whose price the fair-price signal (--mm-coinbase) and the alarms "
+                        "watch (default coinbase; binance = Binance's BTCUSDT for BTC/USD)")
     p.add_argument("--mm-rate-tier", choices=("none", "starter", "intermediate", "pro"),
                    default="intermediate",
                    help="obey Kraken's order rate limit for this account level "
@@ -398,14 +407,25 @@ def run_hlreport(args):
 
 def run_leadlag(args):
     from . import leadlag
-    pairs = {f"kraken {args.kraken}": ("kraken", args.kraken),
-             f"coinbase {args.coinbase}": ("coinbase", args.coinbase)}
+    if args.books:
+        books = []
+        for item in _split(args.books):
+            venue, _, symbol = item.partition(":")
+            if not symbol:
+                raise SystemExit(f"--books wants venue:symbol, e.g. binance:BTCUSDT (got {item!r})")
+            books.append((venue, symbol))
+        if len(books) != 2 or books[0] == books[1]:
+            raise SystemExit("--books wants exactly two different books, e.g. binance:BTCUSDT,kraken:BTC/USD")
+        first, second = books
+    else:
+        first, second = ("coinbase", args.coinbase), ("kraken", args.kraken)
+    pairs = {f"{first[0]} {first[1]}": first, f"{second[0]} {second[1]}": second}
     tailer = EventTailer(args.log)
     series, _ = leadlag.sample_mids(tailer, pairs, args.step_ms * 1_000_000)
     tailer.close()
     out = Output(args.out)
     names = list(pairs)
-    for line in leadlag.report(series, names[1], names[0], args.step_ms,
+    for line in leadlag.report(series, names[0], names[1], args.step_ms,
                                threshold_bps=float(args.jump_bps)):
         out.emit(line)
     out.close()
@@ -424,6 +444,8 @@ def main(argv=None):
     live.add_argument("--coinbase", default="BTC-USD,LINK-USD", help="Coinbase products, comma separated ('' = off)")
     live.add_argument("--binanceus", default="BTCUSD,LINKUSD",
                       help="Binance.US symbols, comma separated ('' = off)")
+    live.add_argument("--binance", default="BTCUSDT,LINKUSDT",
+                      help="Binance (global) market-data symbols, comma separated ('' = off)")
     live.add_argument("--data-dir", default="data")
     live.add_argument("--log", help="log file path (must not exist yet)")
     live.add_argument("--out", help="also write output lines to this file")
@@ -458,6 +480,8 @@ def main(argv=None):
     ll.add_argument("log")
     ll.add_argument("--kraken", default="BTC/USD")
     ll.add_argument("--coinbase", default="BTC-USD")
+    ll.add_argument("--books", help="any two books instead, as venue:symbol, the one tested as "
+                                    "leader first, e.g. binance:BTCUSDT,kraken:BTC/USD")
     ll.add_argument("--step-ms", type=int, default=50, help="sampling step (default 50)")
     ll.add_argument("--jump-bps", default="2", help="size of a 'jump' in the event study (default 2)")
     ll.add_argument("--out", help="also write the report to this file")

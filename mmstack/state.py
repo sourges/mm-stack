@@ -57,6 +57,7 @@ class StateMachine:
         self.last_top = {}  # (venue, symbol) -> (bid, ask) last printed
         self.cb_last_seq = None  # Coinbase sequence_num on the current connection
         # Binance.US, per symbol, reset on every (re)connect
+        # Binance.US and Binance, per (venue, symbol), reset on every (re)connect
         self.bn_last_id = {}  # last book lastUpdateId seen
         self.bn_last_trade = {}  # last trade id seen
         self.bn_ticker = {}  # latest bookTicker: (update id, bid, ask)
@@ -81,12 +82,14 @@ class StateMachine:
         self.paper_config = None
         self.paper = {}  # symbol -> PaperMarketMaker
         self.paper_venue = "kraken"
+        self.paper_ref = "coinbase"  # whose price is the reference (fair price signal, alarm)
         if paper_mm:
             self._enable_paper(paper_mm)
 
     def _enable_paper(self, cfg):
         self.paper_config = cfg
         self.paper_venue = cfg.get("venue", "kraken")  # whose book and trades we quote on
+        self.paper_ref = cfg.get("ref", "coinbase")  # whose price the signal and alarm watch
         on_binance = self.paper_venue == "binanceus"
         for sym in cfg["symbols"]:
             mm = PaperMarketMaker(sym, spread=Decimal(cfg["spread"]),
@@ -134,7 +137,7 @@ class StateMachine:
         return actions
 
     def _invalidate_venue(self, venue):
-        if venue == "coinbase":  # the paper market maker must stop using Coinbase's price
+        if venue == self.paper_ref:  # the paper market maker must stop using that venue's price
             for mm in self.paper.values():
                 mm.on_reference(self.now, None)
         for key in self.books:
@@ -185,8 +188,8 @@ class StateMachine:
             self._invalidate_venue(conn)  # wait for fresh snapshots
             if conn == "coinbase":
                 self.cb_last_seq = None  # sequence numbers restart per connection
-            if conn == "binanceus":
-                self._binanceus_reset()
+            if conn in self.BINANCE_VENUES:
+                self._binance_reset(conn)
             out.append(self._line(f"{conn} connected"))
         elif type_ == "conn_close":
             if conn == self.paper_venue:
@@ -196,8 +199,8 @@ class StateMachine:
             self._invalidate_venue(conn)
             if conn == "kraken_priv":
                 self.private_ready = False
-            if conn == "binanceus":
-                self._binanceus_reset()
+            if conn in self.BINANCE_VENUES:
+                self._binance_reset(conn)
             out.append(self._line(f"{conn} disconnected: {event['data'].get('reason', '')}"))
         elif type_ == "ws_in":
             msg = json.loads(event["data"]["text"], parse_float=Decimal)
@@ -205,8 +208,8 @@ class StateMachine:
                 self._kraken(msg, out)
             elif conn == "coinbase":
                 self._coinbase(msg, out)
-            elif conn == "binanceus":
-                self._binanceus(msg, out)
+            elif conn in self.BINANCE_VENUES:
+                self._binance(conn, msg, out)
             elif conn == "kraken_priv":
                 self._kraken_private(msg, out)
         elif type_ == "session":
@@ -336,7 +339,7 @@ class StateMachine:
                 if line:
                     out.append(line)
                 mm = self.paper.get(symbol.replace("-", "/"))  # BTC-USD -> Kraken's BTC/USD
-                if mm is not None:
+                if mm is not None and self.paper_ref == "coinbase":
                     key = ("coinbase", symbol)
                     mm.on_reference(self.now, self.books[key].mid() if self.valid.get(key) else None)
         elif channel == "market_trades":
@@ -345,91 +348,106 @@ class StateMachine:
         elif msg.get("type") == "error":
             out.append(self._line(f"coinbase error: {msg.get('message')}"))
 
-    # ---------- Binance.US ----------
-    def _binanceus_reset(self):
-        """A new connection: ids may jump over what we missed while away."""
-        self.bn_last_id.clear()
-        self.bn_last_trade.clear()
-        self.bn_ticker.clear()
+    # ---------- Binance.US and Binance (same stream format) ----------
+    BINANCE_VENUES = ("binanceus", "binance")
 
-    def _binanceus(self, msg, out):
+    def _binance_reset(self, conn):
+        """A new connection: ids may jump over what we missed while away."""
+        for d in (self.bn_last_id, self.bn_last_trade, self.bn_ticker):
+            for k in [k for k in d if k[0] == conn]:
+                del d[k]
+
+    def _binance(self, conn, msg, out):
         stream = msg.get("stream")
         if stream is None:
             if "code" in msg or "error" in msg:
-                out.append(self._line(f"binanceus error: {msg}"))
+                out.append(self._line(f"{conn} error: {msg}"))
             return
         data = msg.get("data") or {}
         sym, _, kind = stream.partition("@")
         sym = sym.upper()
         if kind.startswith("depth"):
-            self._binanceus_book(sym, data, out)
+            self._binance_book(conn, sym, data, out)
         elif kind == "trade":
-            self._binanceus_trade(sym, data, out)
+            self._binance_trade(conn, sym, data, out)
         elif kind == "bookTicker":
-            self._count("binanceus.tickers")
-            self.bn_ticker[sym] = (data["u"], bn_decimal(data["b"]), bn_decimal(data["a"]))
+            self._count(f"{conn}.tickers")
+            self.bn_ticker[(conn, sym)] = (data["u"], bn_decimal(data["b"]), bn_decimal(data["a"]))
 
-    def _bn_paper(self, sym):
+    def _bn_paper(self, conn, sym):
         """The paper market maker quoting this Binance.US pair, if any
         (BTCUSD -> the BTC/USD one), only when quoting on Binance.US."""
-        if self.paper_venue != "binanceus" or not sym.endswith("USD"):
+        if conn != "binanceus" or self.paper_venue != "binanceus" or not sym.endswith("USD"):
             return None
         return self.paper.get(sym[:-3] + "/USD")
 
-    def _binanceus_book(self, sym, data, out):
+    def _bn_reference(self, conn, sym):
+        """The paper market maker that uses this Binance pair as its reference
+        price (BTCUSDT -> the BTC/USD one), only with --mm-ref binance."""
+        if conn != "binance" or self.paper_ref != "binance" or not sym.endswith("USDT"):
+            return None
+        return self.paper.get(sym[:-4] + "/USD")
+
+    def _binance_book(self, conn, sym, data, out):
         """Each message is the whole top 20, so it replaces our copy outright:
         no checksum needed, and a missed message can't leave the book wrong."""
-        key = ("binanceus", sym)
+        key = (conn, sym)
         uid = data["lastUpdateId"]
-        last = self.bn_last_id.get(sym)
+        last = self.bn_last_id.get(key)
         if last is not None and uid < last:
-            self._count("binanceus.books_out_of_order")  # older than what we have: ignore
+            self._count(f"{conn}.books_out_of_order")  # older than what we have: ignore
             return
-        self.bn_last_id[sym] = uid
+        self.bn_last_id[key] = uid
         book = Book()
         for price, qty in data.get("bids", []):
             book.bids.set(bn_decimal(price), bn_decimal(qty))
         for price, qty in data.get("asks", []):
             book.asks.set(bn_decimal(price), bn_decimal(qty))
-        mm = self._bn_paper(sym)
+        mm = self._bn_paper(conn, sym)
+        ref = self._bn_reference(conn, sym)
         bid, ask = book.best_bid(), book.best_ask()
         if bid is None or ask is None or bid >= ask:
-            self._count("binanceus.books_bad")  # empty side or crossed: don't trust it
+            self._count(f"{conn}.books_bad")  # empty side or crossed: don't trust it
             if self.valid.get(key):
-                out.append(self._line(f"binanceus {sym} BAD BOOK bid={bid} ask={ask} - not used"))
+                out.append(self._line(f"{conn} {sym} BAD BOOK bid={bid} ask={ask} - not used"))
             self.valid[key] = False
             self.last_top.pop(key, None)
             if mm is not None:
                 out.extend(self._paper_lines(mm.on_book(self.now, book, False)))
+            if ref is not None:
+                out.extend(self._paper_lines(ref.on_reference(self.now, None)))
             return
         self.books[key] = book
         self.valid[key] = True
-        self._count("binanceus.books_ok")
-        ticker = self.bn_ticker.get(sym)
+        self._count(f"{conn}.books_ok")
+        ticker = self.bn_ticker.get(key)
         if ticker is not None and ticker[0] == uid:  # same moment: tops must agree
-            self._count("binanceus.top_check_ok" if ticker[1:] == (bid, ask)
-                        else "binanceus.top_check_differs")
-        line = self._top_line("binanceus", sym)
+            self._count(f"{conn}.top_check_ok" if ticker[1:] == (bid, ask)
+                        else f"{conn}.top_check_differs")
+        line = self._top_line(conn, sym)
         if line:
             out.append(line)
         if mm is not None:
             out.extend(self._paper_lines(mm.on_book(self.now, book, True)))
+        if ref is not None:
+            out.extend(self._paper_lines(ref.on_reference(self.now, book.mid())))
 
-    def _binanceus_trade(self, sym, data, out):
+    def _binance_trade(self, conn, sym, data, out):
         """Trade ids count up by one per symbol, so a jump means we missed trades."""
-        self._count("binanceus.trades")
+        self._count(f"{conn}.trades")
+        key = (conn, sym)
         tid = data["t"]
-        last = self.bn_last_trade.get(sym)
+        last = self.bn_last_trade.get(key)
         if last is not None:
             if tid <= last:
-                self._count("binanceus.trades_repeated")
+                self._count(f"{conn}.trades_repeated")
                 return
             if tid != last + 1:
-                self._count("binanceus.trade_gaps")
-                self._count("binanceus.trades_missed", tid - last - 1)
-                out.append(self._line(f"binanceus {sym} TRADE GAP {last} -> {tid}"))
-        self.bn_last_trade[sym] = tid
-        mm = self._bn_paper(sym)
+                self._count(f"{conn}.trade_gaps")
+                self._count(f"{conn}.trades_missed", tid - last - 1)
+                out.append(self._line(f"{conn} {sym} TRADE GAP {last} -> {tid}"))
+        self.bn_last_trade[key] = tid
+        mm = self._bn_paper(conn, sym)
         if mm is not None:
             # "m" = the buyer was the maker, so the taker sold
             side = "sell" if data["m"] else "buy"
@@ -558,6 +576,7 @@ class StateMachine:
                          + (f"venue=binanceus rate_limit=not_modeled"
                             if self.paper_venue == "binanceus"
                             else f"rate_limit={cfg.get('rate_tier', 'none')}")
+                         + (f" ref={self.paper_ref}" if self.paper_ref != "coinbase" else "")
                          + self._alarm_setting(cfg))
             for sym in sorted(self.paper):
                 lines.extend(self.paper[sym].summary_lines(total))

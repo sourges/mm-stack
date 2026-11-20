@@ -32,8 +32,9 @@ on your PATH. That's fine; the live run tests TLS for real.
 
 ## Run
 
-Record live (BTC and LINK on Kraken, Coinbase and Binance.US by default;
-`--binanceus ''` leaves Binance.US out). Stop with Ctrl+C:
+Record live (BTC and LINK on Kraken, Coinbase and Binance.US, plus Binance's
+BTCUSDT and LINKUSDT, by default; `--binanceus ''` / `--binance ''` leave those
+out). Stop with Ctrl+C:
 
 ```
 python -m mmstack.main live --out out_live.txt
@@ -108,6 +109,7 @@ python -m mmstack.main live --paper-mm --data-dir E:\mmdata          (records th
 | `--mm-alarm-vol` | `0` | Volatility alarm: ring when Coinbase moves K times its normal move per window (`0` = off). `--mm-alarm-bps` then sets a floor |
 | `--mm-alarm-vol-tau-s` | `600` | ...where "normal" is averaged over about this many seconds |
 | `--mm-venue` | `kraken` | Whose book and trades to quote on: `kraken` or `binanceus` |
+| `--mm-ref` | `coinbase` | Whose price the fair-price signal and the alarms watch: `coinbase` or `binance` (BTCUSDT for BTC/USD) |
 | `--mm-rate-tier` | `intermediate` | obey Kraken's order rate limit for this account level (`starter`, `intermediate`, `pro`); `none` = only measure it |
 
 How it works:
@@ -201,6 +203,17 @@ Samples both BTC mids every 50 ms (by our receive time) and prints:
   the other had already moved and how much it moved over the next second.
 
 Options: `--kraken LINK/USD --coinbase LINK-USD`, `--jump-bps 1`, `--step-ms 50`.
+
+## Research: which exchange moves first?
+
+```
+python -m mmstack.main leadlag E:\mmdata\LOG.jsonl.gz --out leadlag.txt
+python -m mmstack.main leadlag E:\mmdata\LOG.jsonl.gz --books binance:BTCUSDT,kraken:BTC/USD
+```
+
+Without `--books` it compares Coinbase BTC-USD with Kraken BTC/USD, as
+before. `--books A,B` compares any two recorded books (`venue:symbol`); the
+first is the one tested as the leader.
 
 ## Research: watch a Hyperliquid market maker
 
@@ -338,6 +351,10 @@ summary kraken.checksum_ok=48211
     message and a book message carry the same update id, their tops must
     agree. `differs` should stay at or near 0.
   - Binance.US closes every connection after 24 hours; it reconnects by itself.
+- **Binance** (`binance BTCUSDT ...`): Binance's global exchange, from its
+  market-data-only stream (`data-stream.binance.vision`; no account, no key,
+  no private data). Same messages and checks as Binance.US, counted as
+  `binance.*`. Recorded as a reference price only; nothing ever quotes there.
 - `ACTION MISMATCH` means replay decided something different from what live
   logged. That must never happen; if it does, the state machine depends on
   something that isn't in the log.
