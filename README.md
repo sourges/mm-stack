@@ -82,6 +82,30 @@ python -m mmstack.main replay E:\mmdata\20261113-111358.jsonl.gz
 Options: `--kraken "BTC/USD,ETH/USD"`, `--coinbase "BTC-USD"`, and `--kraken ""`
 to turn a venue off.
 
+## Test days (`days`)
+
+Which test days the diaries hold, and whether to trust them:
+
+```
+python -m mmstack.main days E:\mmdata
+```
+
+- Each diary is cut into **24 h pieces from its first event**. Old diaries
+  (started in the evening) give evening-to-evening days; diaries that start
+  at midnight give calendar days.
+- A piece under **16 h** is listed as `too short` and not used; under 20 h
+  it's flagged `short`.
+- **weekday / weekend**: where most of its hours fall, Saturday 00:00 to
+  Monday 00:00 New York time (exactly half counts as weekday).
+- **venues**: exchanges that sent data in that piece.
+- **gap**: an exchange silent for 5 minutes or more (from its last message
+  before the silence), shown in minutes. **drops**: connection closes.
+- Each diary is read once (a big `.gz` takes a few minutes) and the result
+  kept in `days_index.json` in the same folder. A diary scanned as `.jsonl`
+  keeps its scan after `compress`. Diaries changed in the last 2 minutes
+  (still recording) are skipped.
+- Needs the `tzdata` package on Windows: `pip install -r requirements.txt`.
+
 ## Replay part of a log (`--from` / `--to`)
 
 For cutting a long log into test days (the experiment runner uses this):

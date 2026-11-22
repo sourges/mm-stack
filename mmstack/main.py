@@ -451,6 +451,15 @@ def run_hlreport(args):
     out.close()
 
 
+def run_days(args):
+    from . import days
+    found, recording = days.find_days(
+        args.folder, index_path=args.index,
+        progress=lambda name: print(f"scanning {name} (once; saved to the index)...", flush=True))
+    for line in days.report(found, recording):
+        print(line)
+
+
 def run_leadlag(args):
     from . import leadlag
     if args.books:
@@ -526,6 +535,11 @@ def main(argv=None):
     comp.add_argument("--delete", action="store_true",
                       help="delete each original after its .gz is verified")
     comp.set_defaults(func=run_compress)
+
+    dy = sub.add_parser("days", help="list the test days in a folder of diaries, with gaps and flags")
+    dy.add_argument("folder", help="folder of diaries, e.g. E:\\mmdata")
+    dy.add_argument("--index", help="index file (default: days_index.json in the folder)")
+    dy.set_defaults(func=run_days)
 
     ll = sub.add_parser("leadlag", help="research: does Coinbase's price move before Kraken's?")
     ll.add_argument("log")
