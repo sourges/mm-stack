@@ -48,7 +48,8 @@ def round_to(value, increment, rounding):
 
 
 class StateMachine:
-    def __init__(self, test_order_symbol=None, pretend_private_ready=False, paper_mm=None):
+    def __init__(self, test_order_symbol=None, pretend_private_ready=False, paper_mm=None,
+                 paper_from_ns=None, paper_to_ns=None):
         self.now = None  # ns, from the last event
         self.first_t = None  # ns of the first event; used to build order ids
         self.conns = {}  # conn name -> "connecting" / "open" / "closed"
@@ -83,10 +84,26 @@ class StateMachine:
         self.paper = {}  # symbol -> PaperMarketMaker
         self.paper_venue = "kraken"
         self.paper_ref = "coinbase"  # whose price is the reference (fair price signal, alarm)
+        # Replay window (runner): before paper_from_ns the books build but the paper
+        # market maker doesn't exist yet; it starts on the first event at or after it.
+        # paper_to_ns is only reported here; the caller stops reading the log there.
+        self.paper_from_ns = paper_from_ns
+        self.paper_to_ns = paper_to_ns
+        self.paper_start_t = None  # ns the paper market maker started (summary time base)
+        self._paper_pending = None  # config waiting for paper_from_ns
         if paper_mm:
-            self._enable_paper(paper_mm)
+            self._start_paper(paper_mm)
+
+    def _start_paper(self, cfg):
+        """Start the paper market maker now, or hold it until the window opens."""
+        if self.paper_from_ns is not None and (self.now is None or self.now < self.paper_from_ns):
+            self._paper_pending = cfg
+        else:
+            self._enable_paper(cfg)
 
     def _enable_paper(self, cfg):
+        self._paper_pending = None
+        self.paper_start_t = self.now
         self.paper_config = cfg
         self.paper_venue = cfg.get("venue", "kraken")  # whose book and trades we quote on
         self.paper_ref = cfg.get("ref", "coinbase")  # whose price the signal and alarm watch
@@ -177,6 +194,8 @@ class StateMachine:
         self.now = event["t"]
         if self.first_t is None:
             self.first_t = event["t"]
+        if self._paper_pending is not None and self.now >= self.paper_from_ns:
+            self._enable_paper(self._paper_pending)
         type_ = event["type"]
         conn = event["conn"]
         self._count(f"events.{type_}")
@@ -222,8 +241,8 @@ class StateMachine:
             sym = event["data"].get("test_order")
             if sym and self.test_phase == "off":
                 self.test_symbol, self.test_phase = sym, "waiting"
-            if event["data"].get("paper_mm") and not self.paper:
-                self._enable_paper(event["data"]["paper_mm"])
+            if event["data"].get("paper_mm") and not self.paper and self._paper_pending is None:
+                self._start_paper(event["data"]["paper_mm"])
         elif type_ == "action":
             self._check_logged_action(event["data"], out)
         elif type_ == "action_rejected":
@@ -235,6 +254,15 @@ class StateMachine:
         # Time-based decisions run after EVERY event, timer ticks included.
         self._test_order_step(out)
         return out
+
+    def _window_line(self):
+        """What part of the log the paper market maker actually saw."""
+        def when(t):
+            return iso(t) if t is not None else "-"
+        start = self.paper_start_t if self.paper_start_t is not None else self.first_t  # --to only
+        hours = (Decimal(self.now - start) / 3_600_000_000_000) if (start is not None and self.now) else Decimal(0)
+        return (f"summary window from={when(self.paper_from_ns)} to={when(self.paper_to_ns)} "
+                f"paper_start={when(start)} last_event={when(self.now)} hours={hours:.2f}")
 
     # ---------- action bookkeeping ----------
     def _check_logged_action(self, logged, out):
@@ -578,8 +606,12 @@ class StateMachine:
             lines.append(f"summary actions.not_in_log={len(self._expected)}")
         if self.test_phase != "off":
             lines.append(f"summary test_order={self.test_phase}")
+        if self.paper_from_ns is not None or self.paper_to_ns is not None:
+            lines.append(self._window_line())
         if self.paper:
-            total = (self.now - self.first_t) if self.now is not None else 0
+            # Without a window the time base stays the first event, as it always was.
+            start = self.paper_start_t if self.paper_from_ns is not None else self.first_t
+            total = (self.now - start) if self.now is not None else 0
             cfg = self.paper_config
             lines.append(f"summary paper settings spread={Decimal(cfg['spread']) * 100}% "
                          f"max_inv={cfg.get('max_inv', 5)}x requote={cfg.get('requote', '0.1')} "

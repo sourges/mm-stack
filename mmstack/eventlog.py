@@ -102,6 +102,38 @@ class EventTailer:
         self._f.close()
 
 
+class WindowTailer:
+    """Wraps an EventTailer and stops at the first event at or after until_ns.
+
+    Events before it come through unchanged; from that event on, read_available()
+    returns [] for good, so a replay ends there exactly like at the end of a log.
+    until_ns=None means no end (same as the plain tailer).
+    """
+
+    def __init__(self, tailer, until_ns=None):
+        self._tailer = tailer
+        self.until_ns = until_ns
+        self.reached_end = False  # True once an event at/after until_ns was seen
+
+    def read_available(self):
+        if self.reached_end:
+            return []
+        events = self._tailer.read_available()
+        if self.until_ns is None:
+            return events
+        for i, ev in enumerate(events):
+            if ev["t"] >= self.until_ns:
+                self.reached_end = True
+                return events[:i]
+        return events
+
+    def pending_partial(self):
+        return self._tailer.pending_partial()
+
+    def close(self):
+        self._tailer.close()
+
+
 class CompressError(Exception):
     pass
 

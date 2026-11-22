@@ -82,6 +82,27 @@ python -m mmstack.main replay E:\mmdata\20261113-111358.jsonl.gz
 Options: `--kraken "BTC/USD,ETH/USD"`, `--coinbase "BTC-USD"`, and `--kraken ""`
 to turn a venue off.
 
+## Replay part of a log (`--from` / `--to`)
+
+For cutting a long log into test days (the experiment runner uses this):
+
+```
+python -m mmstack.main replay E:\mmdata\20261120-161328.jsonl.gz --paper-mm --from 2026-11-21T05:00:00Z --to 2026-11-22T05:00:00Z
+```
+
+- Everything before `--from` is still read, so the order books are complete
+  when the window opens, but the paper market maker **only starts at the
+  first event at or after `--from`**. Fills, markouts, quoted time and PnL
+  count only inside the window.
+- Reading stops at the first event at or after `--to`.
+- Times need a zone: `Z` for UTC, or an offset like `-05:00` (New York in
+  winter). A time without one is refused, so a day can't silently shift.
+- The summary gets a `summary window ...` line: the window asked for, when the
+  paper market maker actually started, the last event read, and the hours.
+- The Coinbase alarm's volatility mode (`--mm-alarm-vol`) warms up from the
+  window start, like at the start of a log.
+- Without `--from`/`--to`, replay is exactly as before.
+
 ## Step 10 (paper mode): the market maker, with simulated orders
 
 Nothing is sent to an exchange. It runs inside the state machine, so it works

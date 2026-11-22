@@ -24,11 +24,11 @@ import signal
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from . import venues
-from .eventlog import CompressError, EventTailer, EventWriter, compress_log
+from .eventlog import CompressError, EventTailer, EventWriter, WindowTailer, compress_log
 from .kraken_auth import load_keys
 from .kraken_private import KrakenPrivateClient
 from .net import Reactor, WsClient
@@ -234,11 +234,44 @@ def run_live(args):
         print(f"log saved: {log_path}", file=sys.stderr)
 
 
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def parse_when(text):
+    """'2026-11-20T16:13:28Z' or '2026-11-20T11:13:28-05:00' -> ns since 1970.
+    A time with no zone is refused: 'midnight' means different things in UTC
+    and New York, and guessing wrong would silently shift every test day."""
+    s = text.strip()
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        raise ValueError(f"not a date/time: {text!r} (use e.g. 2026-11-20T16:13:28Z)")
+    if dt.tzinfo is None:
+        raise ValueError(f"{text!r} has no time zone: add Z (UTC) or an offset like -05:00")
+    return (dt - EPOCH) // timedelta(microseconds=1) * 1000
+
+
+def replay_window(args):
+    """(from_ns, to_ns) from --from/--to, either may be None. Exits on bad input."""
+    try:
+        start = parse_when(args.start) if args.start else None
+        end = parse_when(args.end) if args.end else None
+    except ValueError as e:
+        sys.exit(f"replay: {e}")
+    if start is not None and end is not None and start >= end:
+        sys.exit("replay: --from must be before --to")
+    return start, end
+
+
 def run_replay(args):
-    tailer = EventTailer(args.log)
+    start, end = replay_window(args)
+    tailer = WindowTailer(EventTailer(args.log), until_ns=end)
     sm = StateMachine(test_order_symbol=args.test_order,
                       pretend_private_ready=args.pretend_private,
-                      paper_mm=paper_config(args))
+                      paper_mm=paper_config(args),
+                      paper_from_ns=start, paper_to_ns=end)
     out = Output(args.out)
     consume(tailer, sm, out, follow=False)
     for line in sm.summary():
@@ -476,6 +509,11 @@ def main(argv=None):
     rep = sub.add_parser("replay", help="run the state machine over a recorded log")
     rep.add_argument("log")
     rep.add_argument("--out", help="also write output lines to this file")
+    rep.add_argument("--from", dest="start", metavar="TIME",
+                     help="paper market maker starts at this time; earlier events only build "
+                          "the books (e.g. 2026-11-20T16:13:28Z or 2026-11-20T11:13:28-05:00)")
+    rep.add_argument("--to", dest="end", metavar="TIME",
+                     help="stop reading the log at this time (same format as --from)")
     rep.add_argument("--test-order", metavar="SYMBOL",
                      help="dry run: turn on the test order for an old log")
     rep.add_argument("--pretend-private", action="store_true",
