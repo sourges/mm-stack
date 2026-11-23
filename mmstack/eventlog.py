@@ -108,24 +108,35 @@ class WindowTailer:
     Events before it come through unchanged; from that event on, read_available()
     returns [] for good, so a replay ends there exactly like at the end of a log.
     until_ns=None means no end (same as the plain tailer).
+
+    skip_conns: connections whose events are dropped before anything sees them
+    (replay --skip-conns binance: a test that doesn't use Binance doesn't pay
+    for its millions of messages). The time window still uses every event.
     """
 
-    def __init__(self, tailer, until_ns=None):
+    def __init__(self, tailer, until_ns=None, skip_conns=()):
         self._tailer = tailer
         self.until_ns = until_ns
+        self.skip_conns = frozenset(skip_conns)
         self.reached_end = False  # True once an event at/after until_ns was seen
 
     def read_available(self):
-        if self.reached_end:
-            return []
-        events = self._tailer.read_available()
-        if self.until_ns is None:
-            return events
-        for i, ev in enumerate(events):
-            if ev["t"] >= self.until_ns:
-                self.reached_end = True
-                return events[:i]
-        return events
+        while not self.reached_end:
+            events = self._tailer.read_available()
+            if not events:
+                return []
+            if self.until_ns is not None:
+                for i, ev in enumerate(events):
+                    if ev["t"] >= self.until_ns:
+                        self.reached_end = True
+                        events = events[:i]
+                        break
+            if self.skip_conns:
+                events = [ev for ev in events if ev["conn"] not in self.skip_conns]
+            if events or self.reached_end:
+                return events
+            # a whole batch was skipped: read on rather than look like the end of the log
+        return []
 
     def pending_partial(self):
         return self._tailer.pending_partial()

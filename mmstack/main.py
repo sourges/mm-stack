@@ -49,19 +49,34 @@ def is_important(line):
     return any(tag in line for tag in IMPORTANT)
 
 
+# Lines that say something went wrong with the data or the replay itself.
+PROBLEMS = ("MISMATCH", "GAP", "BAD BOOK", "error", "FAILED")
+
+
+def is_problem(line):
+    return any(tag in line for tag in PROBLEMS)
+
+
 class Output:
     """Writes every line to the --out file. On screen it shows either every
-    line (quiet=False) or only the important ones (quiet=True)."""
+    line (quiet=False), only the important ones (quiet=True), or only summary
+    and problem lines (summary_only=True: replay --summary-only, for the runner;
+    printing millions of price lines is what makes a console replay slow)."""
 
-    def __init__(self, path=None, stream=None, quiet=False):
+    def __init__(self, path=None, stream=None, quiet=False, summary_only=False):
         self._stream = stream or sys.stdout
         self._f = open(path, "w", encoding="utf-8", newline="\n") if path else None
         self.quiet = quiet
+        self.summary_only = summary_only
         self.lines = 0
 
     def emit(self, line):
         self.lines += 1
-        if not self.quiet or is_important(line):
+        if self.summary_only:
+            show = line.startswith("summary") or is_problem(line)
+        else:
+            show = not self.quiet or is_important(line)
+        if show:
             print(line, file=self._stream)
         if self._f:
             self._f.write(line + "\n")
@@ -267,12 +282,13 @@ def replay_window(args):
 
 def run_replay(args):
     start, end = replay_window(args)
-    tailer = WindowTailer(EventTailer(args.log), until_ns=end)
+    skip = [c.strip() for c in (args.skip_conns or "").split(",") if c.strip()]
+    tailer = WindowTailer(EventTailer(args.log), until_ns=end, skip_conns=skip)
     sm = StateMachine(test_order_symbol=args.test_order,
                       pretend_private_ready=args.pretend_private,
                       paper_mm=paper_config(args),
                       paper_from_ns=start, paper_to_ns=end)
-    out = Output(args.out)
+    out = Output(args.out, summary_only=args.summary_only)
     consume(tailer, sm, out, follow=False)
     for line in sm.summary():
         out.emit(line)
@@ -460,6 +476,15 @@ def run_days(args):
         print(line)
 
 
+def run_experiment(args):
+    from . import runner
+    try:
+        runner.run(args.experiment, args.data, args.results, workers=args.workers,
+                   newest=args.newest, dry_run=args.dry_run)
+    except runner.ExperimentError as e:
+        sys.exit(f"run: {e}")
+
+
 def run_leadlag(args):
     from . import leadlag
     if args.books:
@@ -523,6 +548,10 @@ def main(argv=None):
                           "the books (e.g. 2026-11-20T16:13:28Z or 2026-11-20T11:13:28-05:00)")
     rep.add_argument("--to", dest="end", metavar="TIME",
                      help="stop reading the log at this time (same format as --from)")
+    rep.add_argument("--summary-only", action="store_true",
+                     help="print only summary and problem lines (much faster on Windows)")
+    rep.add_argument("--skip-conns", metavar="NAMES",
+                     help="ignore these connections' events, e.g. binance,binanceus")
     rep.add_argument("--test-order", metavar="SYMBOL",
                      help="dry run: turn on the test order for an old log")
     rep.add_argument("--pretend-private", action="store_true",
@@ -540,6 +569,16 @@ def main(argv=None):
     dy.add_argument("folder", help="folder of diaries, e.g. E:\\mmdata")
     dy.add_argument("--index", help="index file (default: days_index.json in the folder)")
     dy.set_defaults(func=run_days)
+
+    ex = sub.add_parser("run", help="experiment runner: base vs one change on every usable day")
+    ex.add_argument("experiment", help="experiment file, e.g. experiments\\coinbase-alarm-link.json")
+    ex.add_argument("--data", default=r"E:\mmdata", help="folder of diaries (default E:\\mmdata)")
+    ex.add_argument("--results", default=r"E:\mmresults\runner",
+                    help="where saved replays, reports and results.csv go (default E:\\mmresults\\runner)")
+    ex.add_argument("--workers", type=int, default=2, help="replays at the same time (default 2)")
+    ex.add_argument("--newest", type=int, metavar="N", help="only the newest N days (e.g. 1 to time one day)")
+    ex.add_argument("--dry-run", action="store_true", help="list the replays it would run, run nothing")
+    ex.set_defaults(func=run_experiment)
 
     ll = sub.add_parser("leadlag", help="research: does Coinbase's price move before Kraken's?")
     ll.add_argument("log")

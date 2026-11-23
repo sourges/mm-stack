@@ -82,6 +82,51 @@ python -m mmstack.main replay E:\mmdata\20261113-111358.jsonl.gz
 Options: `--kraken "BTC/USD,ETH/USD"`, `--coinbase "BTC-USD"`, and `--kraken ""`
 to turn a venue off.
 
+## Experiment runner (`run`)
+
+One idea, every usable day, a fixed verdict. Write the experiment first
+(`experiments\*.json`), e.g. `experiments\coinbase-alarm-link.json`:
+
+```json
+{
+  "question": "Does pulling LINK/USD quotes when Coinbase jumps 2 bps improve PnL per $ before fees?",
+  "base": ["--paper-mm", "LINK/USD"],
+  "change": ["--mm-alarm-bps", "2"],
+  "judge": {"number": "breakeven_fee", "better": "higher"},
+  "needs": ["kraken", "coinbase"],
+  "tuned_on": ["20261114-203102"]
+}
+```
+
+```
+python -m mmstack.main run experiments\coinbase-alarm-link.json
+python -m mmstack.main run experiments\coinbase-alarm-link.json --newest 1     (time one day)
+python -m mmstack.main run experiments\coinbase-alarm-link.json --dry-run     (list the replays)
+```
+
+- `judge.number`: `markout_1s`, `markout_5s`, `markout_30s`, `fills`,
+  `pnl_fee0`, `pnl_fee0.10`, `pnl_fee0.40`, `breakeven_fee`,
+  `spread_earned`, `inventory_drift`.
+- `needs`: venues a day must have (default kraken, coinbase). Venues not
+  needed are skipped in the replay (`--skip-conns`), which saves a lot of time.
+- `tuned_on`: diaries used to pick the setting; their days don't count.
+- Days come from `days` (16 h+, no gap in a needed venue). Each day is
+  replayed twice (base, base + change) with `--from/--to --summary-only`,
+  2 at a time (`--workers`), at low priority.
+- **Saved replays**: `E:\mmresults\runner\cache`, keyed by diary, day,
+  settings and a fingerprint of the bot's code. Reruns only replay new days;
+  any change to the code redoes everything.
+- **Verdict** per symbol, weekdays and weekends apart: WORKS / DOESN'T WORK
+  need 7+ days, better (worse) on at least 6 of 7, and the average gain more
+  than 2x its wobble (standard error). Otherwise NOT ENOUGH EVIDENCE, with
+  the reason. A day where the change keeps under half the base fills counts
+  as worse and its gain isn't averaged in (booth hiding).
+- Days with ACTION MISMATCH or a failed replay are left out and listed. Other
+  problem lines (reconnects) are counted in the notes.
+- Output: on screen, `E:\mmresults\runner\<experiment>\report.txt`, and
+  rows appended to `E:\mmresults\runner\results.csv` (same columns every time).
+- `replay --summary-only` and `--skip-conns NAMES` also work by hand.
+
 ## Test days (`days`)
 
 Which test days the diaries hold, and whether to trust them:
