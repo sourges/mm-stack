@@ -89,10 +89,10 @@ One idea, every usable day, a fixed verdict. Write the experiment first
 
 ```json
 {
-  "question": "Does pulling LINK/USD quotes when Coinbase jumps 2 bps improve PnL per $ before fees?",
+  "question": "Does pulling LINK/USD quotes when Coinbase jumps 2 bps improve total PnL before fees (pnl_fee0, $)?",
   "base": ["--paper-mm", "LINK/USD"],
   "change": ["--mm-alarm-bps", "2"],
-  "judge": {"number": "breakeven_fee", "better": "higher"},
+  "judge": {"number": "pnl_fee0", "better": "higher"},
   "needs": ["kraken", "coinbase"],
   "tuned_on": ["20261114-203102"]
 }
@@ -107,20 +107,25 @@ python -m mmstack.main run experiments\coinbase-alarm-link.json --dry-run     (l
 - `judge.number`: `markout_1s`, `markout_5s`, `markout_30s`, `fills`,
   `pnl_fee0`, `pnl_fee0.10`, `pnl_fee0.40`, `breakeven_fee`,
   `spread_earned`, `inventory_drift`.
+- Prefer a **total** number (`pnl_fee0`) over per $ or per fill: a change
+  that just trades less can look great per $, never in total.
 - `needs`: venues a day must have (default kraken, coinbase). Venues not
-  needed are skipped in the replay (`--skip-conns`), which saves a lot of time.
+  needed are skipped in the replay (`--skip-conns`): their lines are dropped
+  before they're decoded.
 - `tuned_on`: diaries used to pick the setting; their days don't count.
 - Days come from `days` (16 h+, no gap in a needed venue). Each day is
   replayed twice (base, base + change) with `--from/--to --summary-only`,
   2 at a time (`--workers`), at low priority.
 - **Saved replays**: `E:\mmresults\runner\cache`, keyed by diary, day,
   settings and a fingerprint of the bot's code. Reruns only replay new days;
-  any change to the code redoes everything.
+  any change to replay code redoes everything (`runner.py` and `days.py`
+  don't count: they can't change a replay).
 - **Verdict** per symbol, weekdays and weekends apart: WORKS / DOESN'T WORK
   need 7+ days, better (worse) on at least 6 of 7, and the average gain more
   than 2x its wobble (standard error). Otherwise NOT ENOUGH EVIDENCE, with
-  the reason. A day where the change keeps under half the base fills counts
-  as worse and its gain isn't averaged in (booth hiding).
+  the reason. A day where the change keeps under a quarter of the base fills
+  counts as worse and its gain isn't averaged in (booth hiding; the Coinbase
+  alarm keeps ~40% by design).
 - Days with ACTION MISMATCH or a failed replay are left out and listed. Other
   problem lines (reconnects) are counted in the notes.
 - Output: on screen, `E:\mmresults\runner\<experiment>\report.txt`, and

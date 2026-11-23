@@ -283,7 +283,7 @@ def replay_window(args):
 def run_replay(args):
     start, end = replay_window(args)
     skip = [c.strip() for c in (args.skip_conns or "").split(",") if c.strip()]
-    tailer = WindowTailer(EventTailer(args.log), until_ns=end, skip_conns=skip)
+    tailer = WindowTailer(EventTailer(args.log, skip_conns=skip), until_ns=end)
     sm = StateMachine(test_order_symbol=args.test_order,
                       pretend_private_ready=args.pretend_private,
                       paper_mm=paper_config(args),

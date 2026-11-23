@@ -1,8 +1,8 @@
 {
-  "question": "Does pulling LINK/USD quotes when Coinbase jumps 2 bps improve PnL per $ traded before fees (break-even fee)?",
+  "question": "Does pulling LINK/USD quotes when Coinbase jumps 2 bps improve total PnL before fees (pnl_fee0, $)?",
   "base": ["--paper-mm", "LINK/USD"],
   "change": ["--mm-alarm-bps", "2"],
-  "judge": {"number": "breakeven_fee", "better": "higher"},
+  "judge": {"number": "pnl_fee0", "better": "higher"},
   "needs": ["kraken", "coinbase"],
   "tuned_on": ["20261114-203102"]
 }

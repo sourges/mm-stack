@@ -24,8 +24,10 @@ For each usable test day (from days.py) it replays base and base+change with
   DOESN'T WORK   the same, the other way
   NOT ENOUGH EVIDENCE   everything else (the default)
 
-Booth hiding: a day where the change keeps less than half the baseline's
-fills counts as worse, however good its markout looks.
+Booth hiding: a day where the change keeps less than a quarter of the
+baseline's fills counts as worse, however good its markout looks, and its
+gain isn't averaged in. Judging on total $ (pnl_fee0) rather than per $ or
+per fill also keeps hiding from looking good.
 
 Each replay's output is saved under a key made of the diary, the day, the
 settings and a fingerprint of the bot's code, so a rerun only replays what's
@@ -49,7 +51,10 @@ from . import days as days_mod
 MIN_DAYS = 7
 WIN_SHARE = 6 / 7  # better on at least 6 of every 7 days
 WOBBLES = 2  # the average gain must be more than this many standard errors
-HIDING_SHARE = 0.5  # change keeps fewer fills than this share of base: hiding
+HIDING_SHARE = 0.25  # change keeps fewer fills than this share of base: hiding
+# (an alarm is MEANT to drop fills: the Coinbase alarm keeps ~40%. Hiding is
+# the imbalance alarm keeping 2.4%. Judge on total $ (pnl_fee0), not per $,
+# and hiding can't win anyway.)
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(PACKAGE_DIR)
 
@@ -114,12 +119,17 @@ def load_experiment(path):
 
 
 # ---------- code fingerprint ----------
+# Files that can't change a replay's output: editing them keeps saved replays.
+NOT_REPLAY_CODE = ("runner.py", "days.py")
+
+
 def code_fingerprint(package_dir=PACKAGE_DIR):
-    """Hash of every .py file in the package. Line endings are normalised, so
-    the same code checked out on Windows and Linux gives the same fingerprint."""
+    """Hash of the package's .py files that replay uses (all but NOT_REPLAY_CODE).
+    Line endings are normalised, so the same code checked out on Windows and
+    Linux gives the same fingerprint."""
     h = hashlib.sha256()
     for name in sorted(os.listdir(package_dir)):
-        if name.endswith(".py"):
+        if name.endswith(".py") and name not in NOT_REPLAY_CODE:
             with open(os.path.join(package_dir, name), "rb") as f:
                 h.update(name.encode() + b"\0" + f.read().replace(b"\r\n", b"\n") + b"\0")
     return h.hexdigest()[:16]

@@ -126,6 +126,7 @@ class TestExperimentFile(unittest.TestCase):
     def test_shipped_experiment_loads(self):
         exp = runner.load_experiment(os.path.join(runner.REPO_DIR, "experiments", "coinbase-alarm-link.json"))
         self.assertEqual(exp["tuned_on"], ["20261114-203102"])
+        self.assertEqual(exp["judge"], {"number": "pnl_fee0", "better": "higher"})  # total $: hiding can't win
 
 
 class TestFingerprint(unittest.TestCase):
@@ -140,6 +141,20 @@ class TestFingerprint(unittest.TestCase):
             with open(os.path.join(b, "x.py"), "ab") as f:
                 f.write(b"z = 3\n")
             self.assertNotEqual(runner.code_fingerprint(a), runner.code_fingerprint(b))
+
+    def test_runner_and_day_finder_edits_keep_saved_replays(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("state.py", "runner.py", "days.py"):
+                with open(os.path.join(d, name), "w") as f:
+                    f.write("x = 1\n")
+            before = runner.code_fingerprint(d)
+            for name in ("runner.py", "days.py"):
+                with open(os.path.join(d, name), "a") as f:
+                    f.write("y = 2\n")
+            self.assertEqual(runner.code_fingerprint(d), before)
+            with open(os.path.join(d, "state.py"), "a") as f:
+                f.write("y = 2\n")
+            self.assertNotEqual(runner.code_fingerprint(d), before)
 
 
 class TestParseSummary(unittest.TestCase):
@@ -263,9 +278,12 @@ class TestJudging(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["diff"], -0.6)
 
     def test_hiding(self):
-        rows, _ = runner.compare(GOOD, self.jobs([(summary_text(fills=1031), summary_text(fills=25, markout=3.0)),
-                                                  (summary_text(fills=100), summary_text(fills=50))]))
-        self.assertEqual([r["hiding"] for r in rows], [True, False])
+        rows, _ = runner.compare(GOOD, self.jobs([
+            (summary_text(fills=1031), summary_text(fills=25, markout=3.0)),  # the imbalance alarm
+            (summary_text(fills=203), summary_text(fills=91)),  # the Coinbase alarm: meant to drop fills
+            (summary_text(fills=100), summary_text(fills=25)),
+            (summary_text(fills=100), summary_text(fills=24))]))
+        self.assertEqual([r["hiding"] for r in rows], [True, False, False, True])
 
     def test_left_out(self):
         bad = summary_text(extra="ACTION MISMATCH: log has x, state machine produced y\n")
@@ -341,6 +359,56 @@ class TestReplayHelpers(unittest.TestCase):
                 got.extend(batch)
             w.close()
         self.assertEqual([(e["conn"], (e["t"] - T0) // NS) for e in got], [("kraken", 2), ("kraken", 5)])
+
+    def test_skipped_lines_are_never_decoded(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.jsonl")
+            with open(path, "wb") as f:
+                f.write(b'{"seq":1,"t":5,"conn":"binance","type":"ws_in","data":{NOT JSON AT ALL\n')
+                f.write(b'{"seq":2,"t":6,"conn":"binanceus","type":"ws_in","data":{}}\n')
+                f.write(b'{"seq":3,"t":7,"conn":"binance_x","type":"ws_in","data":{}}\n')
+            t = EventTailer(path, skip_conns=["binance"])
+            got = t.read_available()
+            t.close()
+            t = EventTailer(path)
+            with self.assertRaises(ValueError):  # without skipping, the bad line is decoded and fails
+                t.read_available()
+            t.close()
+        self.assertEqual([e["conn"] for e in got], ["binanceus", "binance_x"])  # whole names only
+
+    def test_a_chunk_of_only_skipped_lines_reads_on(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.jsonl")
+            with open(path, "wb") as f:
+                for i in range(30000):  # well over one 1 MB chunk of Binance
+                    f.write(b'{"seq":%d,"t":%d,"conn":"binance","type":"ws_in","data":{"text":"%s"}}\n'
+                            % (i, i, b"x" * 40))
+                f.write(b'{"seq":30000,"t":30000,"conn":"kraken","type":"ws_in","data":{}}\n')
+            t = EventTailer(path, skip_conns=["binance"])
+            got = t.read_available()
+            self.assertEqual(t.read_available(), [])
+            t.close()
+        self.assertEqual([e["seq"] for e in got], [30000])
+
+    def test_skipping_gives_the_same_replay_as_a_log_without_those_lines(self):
+        evs = market(30)
+        noise = [event(0, "binance", "ws_in", {"text": '{"e":"bookTicker","b":"1","a":"2"}'},
+                       t=ev["t"] + 1) for ev in evs]
+        with tempfile.TemporaryDirectory() as d:
+            mixed, plain = os.path.join(d, "mixed.jsonl"), os.path.join(d, "plain.jsonl")
+            write_log(mixed, sorted(evs + noise, key=lambda e: e["t"]))
+            with open(mixed, "ab") as f:  # replay must skip it undecoded, or this line breaks it
+                f.write(b'{"seq":9,"t":%d,"conn":"binance","type":"ws_in","data":{BROKEN\n' % evs[-1]["t"])
+            write_log(plain, evs)
+            outs = []
+            for path, extra in ((mixed, ["--skip-conns", "binance"]), (plain, [])):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    main(["replay", path, "--paper-mm", "BTC/USD", "--mm-fills", "through",
+                          "--summary-only"] + extra)
+                outs.append([x for x in buf.getvalue().splitlines() if "events.ws_in" not in x])
+        self.assertEqual(outs[0], outs[1])
+        self.assertTrue(any("summary paper BTC/USD fills=30 " in x for x in outs[0]))
 
     def test_all_skipped_batch_is_not_the_end(self):
         class Batches:

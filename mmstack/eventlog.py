@@ -73,13 +73,28 @@ class EventTailer:
     arrives, so we never parse half an event.
 
     Works on .jsonl.gz too (replay only; a compressed log never grows).
+
+    skip_conns: connections whose lines are dropped BEFORE they are decoded.
+    Decoding is most of a replay's cost, so a test that doesn't use Binance
+    shouldn't decode Binance's millions of lines just to throw them away.
+    The connection name is read straight from the start of the line, where
+    the writer always puts it: {"seq":..,"t":..,"conn":"binance",...
     """
 
     CHUNK = 1 << 20  # read 1 MB at a time
+    _CONN = b'"conn":"'
 
-    def __init__(self, path):
+    def __init__(self, path, skip_conns=()):
         self._f = open_log(path)
         self._buf = b""
+        self._skip = frozenset(c.encode() for c in skip_conns)
+
+    def _skipped(self, line):
+        i = line.find(self._CONN, 0, 80)  # always within the first ~60 bytes
+        if i < 0:
+            return False  # unusual line: decode it as usual
+        start = i + len(self._CONN)
+        return line[start:line.find(b'"', start)] in self._skip
 
     def read_available(self):
         events = []
@@ -90,7 +105,7 @@ class EventTailer:
             parts = (self._buf + chunk).split(b"\n")
             self._buf = parts.pop()  # last piece has no newline yet (may be b"")
             for line in parts:
-                if line.strip():
+                if line.strip() and not (self._skip and self._skipped(line)):
                     events.append(json.loads(line))
         return events
 
