@@ -1,0 +1,8 @@
+{
+  "question": "Is a volatility-scaled Coinbase alarm (4x the normal move, 1.5 bp floor) better than the fixed 2 bp alarm for LINK/USD (pnl_fee0, $)?",
+  "base": ["--paper-mm", "LINK/USD", "--mm-alarm-bps", "2"],
+  "change": ["--mm-alarm-vol", "4", "--mm-alarm-bps", "1.5"],
+  "judge": {"number": "pnl_fee0", "better": "higher"},
+  "needs": ["kraken", "coinbase"],
+  "tuned_on": ["20261114-203102"]
+}

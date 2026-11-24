@@ -1,0 +1,7 @@
+{
+  "question": "Does the same BTC booth do better quoting on Binance.US (0% maker fee) than on Kraken, before fees (pnl_fee0, $)?",
+  "base": ["--paper-mm", "BTC/USD"],
+  "change": ["--mm-venue", "binanceus"],
+  "judge": {"number": "pnl_fee0", "better": "higher"},
+  "needs": ["kraken", "coinbase", "binanceus"]
+}

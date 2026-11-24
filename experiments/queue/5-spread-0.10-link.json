@@ -1,0 +1,7 @@
+{
+  "question": "Does quoting LINK/USD wider (0.10% from mid instead of 0.05%) improve total PnL before fees (pnl_fee0, $)?",
+  "base": ["--paper-mm", "LINK/USD"],
+  "change": ["--mm-spread", "0.10"],
+  "judge": {"number": "pnl_fee0", "better": "higher"},
+  "needs": ["kraken", "coinbase"]
+}

@@ -1,0 +1,8 @@
+{
+  "question": "Does pulling BTC/USD quotes when Coinbase jumps 1 bp improve total PnL before fees (pnl_fee0, $)?",
+  "base": ["--paper-mm", "BTC/USD"],
+  "change": ["--mm-alarm-bps", "1"],
+  "judge": {"number": "pnl_fee0", "better": "higher"},
+  "needs": ["kraken", "coinbase"],
+  "tuned_on": ["20261114-203102"]
+}

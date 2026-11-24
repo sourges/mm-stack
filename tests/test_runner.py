@@ -123,6 +123,16 @@ class TestExperimentFile(unittest.TestCase):
             runner.load_experiment(path)
         self.assertIn("not valid JSON", str(e.exception))
 
+    def test_every_experiment_file_loads(self):
+        root = os.path.join(runner.REPO_DIR, "experiments")
+        paths = [os.path.join(root, n) for n in os.listdir(root) if n.endswith(".json")]
+        paths += [os.path.join(root, "queue", n) for n in os.listdir(os.path.join(root, "queue"))
+                  if n.endswith(".json")]
+        self.assertGreaterEqual(len(paths), 8)
+        for path in paths:
+            exp = runner.load_experiment(path)
+            self.assertEqual(exp["judge"]["number"], "pnl_fee0", path)  # totals, not per $
+
     def test_shipped_experiment_loads(self):
         exp = runner.load_experiment(os.path.join(runner.REPO_DIR, "experiments", "coinbase-alarm-link.json"))
         self.assertEqual(exp["tuned_on"], ["20261114-203102"])

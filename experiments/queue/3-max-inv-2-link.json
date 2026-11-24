@@ -1,0 +1,8 @@
+{
+  "question": "With the 2 bp Coinbase alarm, does a smaller max inventory (2 order sizes instead of 5) improve LINK/USD total PnL before fees (pnl_fee0, $)?",
+  "base": ["--paper-mm", "LINK/USD", "--mm-alarm-bps", "2"],
+  "change": ["--mm-max-inv", "2"],
+  "judge": {"number": "pnl_fee0", "better": "higher"},
+  "needs": ["kraken", "coinbase"],
+  "tuned_on": ["20261114-203102"]
+}

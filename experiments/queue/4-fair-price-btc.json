@@ -1,0 +1,8 @@
+{
+  "question": "Does leaning BTC/USD quotes toward Coinbase's price (weight 0.65) improve total PnL before fees (pnl_fee0, $)?",
+  "base": ["--paper-mm", "BTC/USD"],
+  "change": ["--mm-coinbase", "0.65"],
+  "judge": {"number": "pnl_fee0", "better": "higher"},
+  "needs": ["kraken", "coinbase"],
+  "tuned_on": ["20261114-203102"]
+}
