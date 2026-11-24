@@ -176,6 +176,8 @@ def parse_summary(text):
         row["requotes"] = _number(kv.get((None, "requotes"), ""))
         row["held_back"] = _number(kv.get(("rate_limit", "held_back"), ""))
         row["peak"] = _number(kv.get(("rate_limit", "peak"), ""))
+        limit = kv.get(("rate_limit", "peak"), "").partition("/")[2]  # "120/125" -> "125"
+        row["peak_limit"] = _number(limit)
         symbols[sym] = row
     return {"hours": hours, "problems": problems, "symbols": symbols}
 
@@ -333,8 +335,18 @@ def compare(exp, jobs):
             hiding = bool(b["fills"]) and (c["fills"] or 0) < HIDING_SHARE * b["fills"]
             rows.append({"day": d, "symbol": sym, "base": b, "change": c, "diff": diff,
                          "hiding": hiding, "problems": len(problems),
-                         "hours": res["base"]["hours"]})
+                         "hours": res["base"]["hours"],
+                         "ceiling": {side: at_ceiling(v) for side, v in (("base", b), ("change", c))}})
     return rows, left_out
+
+
+def at_ceiling(row):
+    """Did this replay's order rate reach Kraken's limit (peak 125/125)? Then
+    requotes and cancels were being held back, and with real orders Kraken
+    would have started refusing them. Shown as a warning; it doesn't change
+    the verdict (the replay already models the held-back requotes)."""
+    return bool(row.get("peak") is not None and row.get("peak_limit")
+                and row["peak"] >= row["peak_limit"])
 
 
 def verdict(rows):
@@ -351,8 +363,10 @@ def verdict(rows):
     wobble = (math.sqrt(sum((x - mean) ** 2 for x in diffs) / (n - 1)) / math.sqrt(n)) if n > 1 else float("inf")
     hidden = sum(1 for r in rows if r["hiding"])
     wob = "n/a" if math.isinf(wobble) else f"{wobble:.3f}"
+    capped = sum(1 for r in rows if r.get("ceiling", {}).get("change"))
     stats = (f"better on {wins} of {n}, worse on {losses}; avg {mean:+.3f} "
-             f"(wobble {wob})" + (f"; {hidden} day(s) hiding" if hidden else ""))
+             f"(wobble {wob})" + (f"; {hidden} day(s) hiding" if hidden else "")
+             + (f"; change hit the rate limit on {capped} of {n} day(s)" if capped else ""))
     if n < MIN_DAYS:
         return "NOT ENOUGH EVIDENCE", f"{n} days (need {MIN_DAYS}); {stats}"
     if wins >= WIN_SHARE * n and mean > WOBBLES * wobble:
@@ -379,6 +393,8 @@ def report(exp, code, rows, left_out, tz):
              f"needs:      {', '.join(exp['needs'])}    code: {code}",
              f"rule:       {MIN_DAYS}+ days, better on {round(WIN_SHARE * 7)} of 7, avg gain > "
              f"{WOBBLES}x wobble; a day keeping < {HIDING_SHARE:.0%} of base fills counts as worse",
+             "warning:    'at rate limit' = order rate reached Kraken's ceiling (e.g. 125/125); "
+             "with real orders Kraken would refuse some",
              ""]
     for sym in sorted({r["symbol"] for r in rows}):
         for kind in ("weekday", "weekend"):
@@ -395,6 +411,9 @@ def report(exp, code, rows, left_out, tz):
             notes.append("hiding")
         if r["problems"]:
             notes.append(f"{r['problems']} problem lines")
+        for side in ("base", "change"):
+            if r.get("ceiling", {}).get(side):
+                notes.append(f"{side} at rate limit")
         notes += [f for f in d["flags"] if f == "short"]
         lines.append(f"{when + ' (' + d['diary'][:15] + ')':<34} {d['kind']:<8} {r['symbol']:<9} "
                      f"{_fmt(r['hours']):>5} {_fmt(r['base'][number]):>9} {_fmt(r['change'][number]):>9} "

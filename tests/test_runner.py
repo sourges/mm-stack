@@ -55,13 +55,16 @@ def write_exp(folder, exp, name="exp.json"):
     return path
 
 
-def summary_text(sym="BTC/USD", fills=100, markout=-1.0, hours=24.0, extra=""):
+def summary_text(sym="BTC/USD", fills=100, markout=-1.0, hours=24.0, extra="", peak=None):
     m = "n/a" if markout is None else f"{markout:.2f}bps"
     return (f"summary window from=- to=- paper_start=- last_event=- hours={hours:.2f}\n"
             f"summary paper {sym} fills={fills} (at_price=0 through={fills} stale=0) buys=1 sells=1 "
             f"volume=1 inventory=0\n"
             f"summary paper {sym} pnl fee0.00%=0.1 fee0.10%=0 fee0.40%=-1 breakeven_fee=0.001%\n"
-            f"summary paper {sym} markout 1s={m} 5s={m} 30s={m} (n={fills})\n" + extra)
+            f"summary paper {sym} markout 1s={m} 5s={m} 30s={m} (n={fills})\n"
+            + (f"summary paper {sym} rate_limit enforced=intermediate held_back=9 cancel_blocked=0 "
+               f"peak={peak}/125\n" if peak is not None else "")
+            + extra)
 
 
 def a_day(i, kind="weekday", venues=("coinbase", "kraken"), gaps=None, usable=True, diary=None):
@@ -218,6 +221,19 @@ class TestParseSummary(unittest.TestCase):
         self.assertIsNone(r["symbols"]["BTC/USD"]["markout_1s"])
         self.assertEqual(r["symbols"]["BTC/USD"]["fills"], 0)
 
+    def test_rate_limit_ceiling(self):
+        r = runner.parse_summary(SATURDAY)["symbols"]["BTC/USD"]
+        self.assertEqual((r["peak"], r["peak_limit"]), (120, 125))
+        self.assertFalse(runner.at_ceiling(r))
+        self.assertTrue(runner.at_ceiling({"peak": 125.0, "peak_limit": 125.0}))
+        self.assertFalse(runner.at_ceiling({"peak": None, "peak_limit": None}))  # not modeled (Binance.US)
+        starter = summary_text().replace("summary paper BTC/USD markout",
+                                         "summary paper BTC/USD rate_limit enforced=starter held_back=1 "
+                                         "cancel_blocked=0 peak=60/60\nsummary paper BTC/USD markout")
+        r = runner.parse_summary(starter)["symbols"]["BTC/USD"]
+        self.assertEqual(r["peak_limit"], 60)  # the limit comes from the line, not a fixed 125
+        self.assertTrue(runner.at_ceiling(r))
+
     def test_without_rate_limit(self):
         r = runner.parse_summary("summary paper LINK/USD rate_limit not modeled (order actions=5)\n"
                                  + summary_text("LINK/USD"))
@@ -334,6 +350,24 @@ class TestJudging(unittest.TestCase):
         self.assertEqual([why for _, _, why in out],
                          ["ACTION MISMATCH (replay doesn't match the log)", "no markout_1s (no fills?)",
                           "replay failed"])
+
+    def test_rate_limit_ceiling_is_flagged_not_judged(self):
+        pairs = [(summary_text(peak=117), summary_text(markout=-0.5, peak=125)),
+                 (summary_text(peak=125), summary_text(markout=-0.5, peak=120))]
+        rows, _ = runner.compare(GOOD, self.jobs(pairs))
+        self.assertEqual([r["ceiling"] for r in rows],
+                         [{"base": False, "change": True}, {"base": True, "change": False}])
+        word, why = runner.verdict(rows)
+        self.assertIn("change hit the rate limit on 1 of 2 day(s)", why)
+        self.assertEqual([r["diff"] for r in rows], [0.5, 0.5])  # the numbers are untouched
+        text = "\n".join(runner.report(dict(GOOD, name="x", needs=["kraken"]), "c", rows, [], days.new_york()))
+        self.assertIn("change at rate limit", text)
+        self.assertIn("base at rate limit", text)
+        self.assertIn("warning:    'at rate limit'", text)
+
+    def test_no_ceiling_no_warning(self):
+        rows, _ = runner.compare(GOOD, self.jobs([(summary_text(peak=100), summary_text(peak=110))]))
+        self.assertNotIn("rate limit", runner.verdict(rows)[1])
 
     def test_other_problems_are_counted_not_dropped(self):
         rows, _ = runner.compare(GOOD, self.jobs([(summary_text(extra="coinbase SEQ GAP 1 -> 5 - reconnecting\n"),
