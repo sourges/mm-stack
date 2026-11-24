@@ -278,6 +278,13 @@ class TestIndex(unittest.TestCase):
         self.assertNotIn("20261122-141620.jsonl", calls)
         self.assertEqual([d["diary"] for d in found], ["20261116-193111.jsonl"])
 
+    def test_a_just_compressed_gz_is_not_recording(self):
+        make_diary(os.path.join(self.folder, "20261117-194922.jsonl.gz"), MON_1931, 20, gz=True)
+        os.utime(os.path.join(self.folder, "20261117-194922.jsonl.gz"), None)  # written a moment ago
+        found, recording, _ = self.find()
+        self.assertEqual(recording, [])
+        self.assertIn("20261117-194922.jsonl.gz", [d["diary"] for d in found])
+
     def test_jsonl_next_to_its_gz_is_skipped(self):
         make_diary(self.a + ".gz", MON_1931, 20, gz=True)
         found, _, _ = self.find()

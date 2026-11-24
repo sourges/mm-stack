@@ -1,0 +1,8 @@
+{
+  "question": "Is Binance.com a better alarm source than Coinbase for LINK/USD (total PnL before fees, pnl_fee0)?",
+  "base": ["--paper-mm", "LINK/USD", "--mm-alarm-bps", "2"],
+  "change": ["--mm-ref", "binance"],
+  "judge": {"number": "pnl_fee0", "better": "higher"},
+  "needs": ["kraken", "coinbase", "binance"],
+  "tuned_on": ["20261114-203102"]
+}

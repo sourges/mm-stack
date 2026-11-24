@@ -155,8 +155,8 @@ def diaries(folder, now=None):
             continue
         if name.endswith(".jsonl") and name + ".gz" in names:
             continue
-        if now - os.path.getmtime(full) < RECENT_SECONDS:
-            recording.append(name)
+        if name.endswith(".jsonl") and now - os.path.getmtime(full) < RECENT_SECONDS:
+            recording.append(name)  # only a plain diary can still be recording; a fresh .gz is done
         else:
             finished.append(name)
     return finished, recording

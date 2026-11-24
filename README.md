@@ -82,6 +82,36 @@ python -m mmstack.main replay E:\mmdata\20261113-111358.jsonl.gz
 Options: `--kraken "BTC/USD,ETH/USD"`, `--coinbase "BTC-USD"`, and `--kraken ""`
 to turn a venue off.
 
+## Daily diaries and the nightly run
+
+**Recorder:** start it with `scripts\recorder.bat` (double-click, or a shortcut
+to it). It runs
+
+```
+python -m mmstack.main live --paper-mm --data-dir E:\mmdata --until-midnight
+```
+
+in a loop. `--until-midnight` stops the recorder cleanly at midnight New York
+time, and the .bat starts the next one 3 seconds later, so each diary is one
+calendar day and starts with fresh connections (full order books: a diary
+must be readable on its own). **Ctrl+C** stops it for good: with
+`--until-midnight` the recorder then exits with code 3 and the .bat ends
+(answer Y if Windows asks "Terminate batch job"). If the recorder crashes,
+the .bat starts it again.
+
+**Nightly:** `scripts\nightly.bat` runs `python -m mmstack.main nightly --workers 3`:
+
+1. `days`: scans new diaries while they're still plain `.jsonl`
+2. `run` for every `experiments\*.json` (one failing doesn't stop the rest)
+3. compresses finished diaries (`--delete`; their scans carry over)
+
+Everything it prints also goes to `E:\mmresults\runner\nightly-YYYYMMDD.txt`.
+Set it up once in Task Scheduler (Command Prompt):
+
+```
+schtasks /Create /TN "mm-stack nightly" /TR "C:\Users\sourg\Desktop\Programing\mm-stack\scripts\nightly.bat" /SC DAILY /ST 01:00
+```
+
 ## Experiment runner (`run`)
 
 One idea, every usable day, a fixed verdict. Write the experiment first

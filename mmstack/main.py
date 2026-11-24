@@ -164,8 +164,23 @@ def build_clients(writer, kraken_symbols, coinbase_products, keys=None,
     return clients
 
 
+STOPPED_BY_USER = 3  # exit code after Ctrl+C with --until-midnight: recorder.bat stops looping
+
+
+def next_midnight(now_s, tz):
+    """Seconds since 1970 of the next midnight in tz after now_s (DST-safe)."""
+    from datetime import timedelta as _td
+    local = datetime.fromtimestamp(now_s, tz)
+    day = (local + _td(days=1)).date()
+    return datetime(day.year, day.month, day.day, tzinfo=tz).timestamp()
+
+
 def run_live(args):
     os.makedirs(args.data_dir, exist_ok=True)
+    stop_at = None
+    if args.until_midnight:
+        from .days import new_york
+        stop_at = next_midnight(time.time(), new_york())
     log_path = args.log or os.path.join(
         args.data_dir, datetime.now().strftime("%Y%m%d-%H%M%S") + ".jsonl")
     private = args.private or args.enable_trading
@@ -204,6 +219,9 @@ def run_live(args):
 
     out = Output(args.out, quiet=not args.verbose)
     print(f"logging to {log_path}  (Ctrl+C to stop)", file=sys.stderr)
+    if stop_at is not None:
+        print(f"--until-midnight: stops at {datetime.fromtimestamp(stop_at).strftime('%Y-%m-%d %H:%M')} "
+              "for a fresh diary (recorder.bat starts the next one)", file=sys.stderr)
     if out.quiet:
         print(f"quiet screen: a status line every {STATUS_SECONDS}s plus important events. "
               "Use --verbose to see every price line.", file=sys.stderr)
@@ -225,7 +243,8 @@ def run_live(args):
     try:
         consume(tailer, sm, out, follow=True, on_action=action_sink(writer, reactor),
                 on_batch=on_batch,
-                should_stop=lambda: bool(presses) or not net_thread.is_alive())
+                should_stop=lambda: (bool(presses) or not net_thread.is_alive()
+                                     or (stop_at is not None and time.time() >= stop_at)))
     finally:
         net_stop.set()
         net_thread.join(timeout=10)
@@ -247,6 +266,8 @@ def run_live(args):
         out.close()
         tailer.close()
         print(f"log saved: {log_path}", file=sys.stderr)
+    if stop_at is not None and presses:
+        sys.exit(STOPPED_BY_USER)  # you pressed Ctrl+C: recorder.bat stops instead of restarting
 
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -485,6 +506,61 @@ def run_experiment(args):
         sys.exit(f"run: {e}")
 
 
+def run_nightly(args):
+    """Everything the PC does at night, in order: scan yesterday's diary, run
+    every experiment, compress finished diaries. One log file for the morning."""
+    from . import days, runner
+    os.makedirs(args.results, exist_ok=True)
+    started = datetime.now()
+    log_path = os.path.join(args.results, f"nightly-{started.strftime('%Y%m%d')}.txt")
+    log = open(log_path, "a", encoding="utf-8", newline="\n")
+    problems = 0
+
+    def say(line=""):
+        print(line, flush=True)
+        log.write(line + "\n")
+        log.flush()
+
+    say(f"=== nightly {started.strftime('%Y-%m-%d %H:%M')} ===")
+    try:
+        # 1. scan new diaries while they're still plain .jsonl (fastest)
+        found, recording = days.find_days(
+            args.data, progress=lambda name: say(f"scanning {name} (once; saved to the index)..."))
+        for line in days.report(found, recording):
+            say(line)
+        # 2. every experiment; one failing doesn't stop the rest
+        names = sorted(n for n in os.listdir(args.experiments) if n.endswith(".json"))
+        for name in names:
+            say("")
+            say(f"--- {name} ---")
+            try:
+                runner.run(os.path.join(args.experiments, name), args.data, args.results,
+                           workers=args.workers, say=say)
+            except Exception as e:  # noqa: BLE001 - report it and carry on
+                problems += 1
+                say(f"FAILED {name}: {e!r}")
+        # 3. compress finished diaries (their scans carry over to the .gz)
+        say("")
+        files, skipped = logs_to_compress([args.data])
+        for path in files:
+            try:
+                before, after = compress_log(path, delete_original=True)
+                say(f"compressed {path} {before / 1e6:.0f} MB -> {after / 1e6:.0f} MB")
+            except (CompressError, OSError) as e:
+                problems += 1
+                say(f"FAILED to compress {path}: {e}")
+        for path in skipped:
+            say(f"not compressed (still recording): {path}")
+    finally:
+        mins = (datetime.now() - started).total_seconds() / 60
+        say("")
+        say(f"=== done in {mins:.0f} min, {problems} problem(s) ===")
+        log.close()
+    print(f"saved: {log_path}")
+    if problems:
+        sys.exit(1)
+
+
 def run_leadlag(args):
     from . import leadlag
     if args.books:
@@ -537,6 +613,9 @@ def main(argv=None):
                       help="allow the network layer to send orders (implies --private)")
     live.add_argument("--test-order", metavar="SYMBOL",
                       help="step 5: place one tiny post-only buy 5%% under the bid, then cancel it")
+    live.add_argument("--until-midnight", action="store_true",
+                      help="stop at midnight New York time (for daily diaries; recorder.bat restarts it). "
+                           "Ctrl+C then exits with code 3 so the .bat stops too")
     add_paper_args(live)
     live.set_defaults(func=run_live)
 
@@ -579,6 +658,14 @@ def main(argv=None):
     ex.add_argument("--newest", type=int, metavar="N", help="only the newest N days (e.g. 1 to time one day)")
     ex.add_argument("--dry-run", action="store_true", help="list the replays it would run, run nothing")
     ex.set_defaults(func=run_experiment)
+
+    ng = sub.add_parser("nightly", help="scan new diaries, run every experiment, compress (for Task Scheduler)")
+    ng.add_argument("--experiments", default="experiments", help="folder of experiment files (default experiments)")
+    ng.add_argument("--data", default=r"E:\mmdata", help="folder of diaries (default E:\\mmdata)")
+    ng.add_argument("--results", default=r"E:\mmresults\runner",
+                    help="results folder; the log goes here as nightly-YYYYMMDD.txt")
+    ng.add_argument("--workers", type=int, default=2, help="replays at the same time (default 2)")
+    ng.set_defaults(func=run_nightly)
 
     ll = sub.add_parser("leadlag", help="research: does Coinbase's price move before Kraken's?")
     ll.add_argument("log")
