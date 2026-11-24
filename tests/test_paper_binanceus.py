@@ -252,3 +252,65 @@ class TestCommandLine(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestQuietBookIsNotStale(unittest.TestCase):
+    """Binance.US only sends a book when it changes. A quiet LINK book while the
+    connection is busy with BTC is current, not stale: any Binance.US message
+    keeps a good book alive. (Before: pulled after 10 s of no LINK book.)"""
+
+    SEC = 1_000_000_000
+
+    def setUp(self):
+        self.sm = StateMachine(paper_mm={"symbols": ["LINK/USD"], "spread": "0.0005", "venue": "binanceus"})
+        self.mm = self.sm.paper["LINK/USD"]
+        self.n = 0
+        self.t0 = 1_800_000_000 * self.SEC
+
+    def at(self, s, conn, type_, data=None):
+        self.n += 1
+        return self.sm.update(event(self.n, conn, type_, data, t=self.t0 + int(s * self.SEC)))
+
+    def bn(self, s, msg):
+        return self.at(s, "binanceus", "ws_in", {"text": json.dumps(msg)})
+
+    def link_book(self, s):
+        return self.bn(s, depth("LINKUSD", s + 1, [("9.270", "50")], [("9.280", "50")]))
+
+    def test_busy_connection_keeps_a_quiet_book_alive(self):
+        self.link_book(0)
+        for s in range(1, 30):  # BTC traffic every second, LINK's book never changes
+            self.bn(s, depth("BTCUSD", 100 + s, *BOOK))
+        out = self.at(30, "main", "timer")
+        self.assertFalse(self.mm.pulled)
+        self.assertEqual(self.mm.stats["stale_pulls"], 0)
+        self.assertEqual(out, [])
+
+    def test_a_silent_connection_still_goes_stale(self):
+        self.link_book(0)
+        out = self.at(11, "main", "timer")
+        self.assertTrue(self.mm.pulled)
+        self.assertTrue(any("quotes pulled" in line for line in out))
+
+    def test_alive_never_brings_back_pulled_quotes(self):
+        self.link_book(0)
+        self.at(11, "main", "timer")  # pulled
+        self.bn(12, depth("BTCUSD", 200, *BOOK))
+        self.assertTrue(self.mm.pulled)
+        self.assertEqual(self.mm.last_book_t, self.t0)  # its age isn't refreshed either
+
+    def test_a_bad_book_is_not_kept_alive(self):
+        self.link_book(0)
+        self.bn(1, depth("LINKUSD", 50, [("9.29", "1")], [("9.28", "1")]))  # crossed: bad
+        self.bn(2, depth("BTCUSD", 300, *BOOK))
+        self.assertFalse(self.mm.book_ok)
+        self.assertEqual(self.mm.last_book_t, self.t0)
+
+    def test_only_when_quoting_on_binanceus(self):
+        sm = StateMachine(paper_mm={"symbols": ["LINK/USD"], "spread": "0.0005"})  # Kraken booth
+        mm = sm.paper["LINK/USD"]
+        spy = Spy(mm, "on_feed_alive")
+        sm.update(event(1, "binanceus", "ws_in", {"text": json.dumps(
+            depth("LINKUSD", 1, [("9.270", "50")], [("9.280", "50")]))}))  # recorded, valid, not ours
+        sm.update(event(2, "binanceus", "ws_in", {"text": json.dumps(depth("BTCUSD", 2, *BOOK))}))
+        self.assertEqual(spy.calls, [])  # Binance.US traffic must not keep a Kraken book "alive"

@@ -406,6 +406,12 @@ class StateMachine:
         elif kind == "bookTicker":
             self._count(f"{conn}.tickers")
             self.bn_ticker[(conn, sym)] = (data["u"], bn_decimal(data["b"]), bn_decimal(data["a"]))
+        if conn == "binanceus" and self.paper_venue == "binanceus":
+            # any message proves the feed is alive; Binance.US only sends a
+            # book when it changes, so an unchanged valid book is still current
+            for symbol, mm in self.paper.items():
+                if self.valid.get((conn, symbol.replace("/", ""))):
+                    out.extend(self._paper_lines(mm.on_feed_alive(self.now)))
 
     def _bn_paper(self, conn, sym):
         """The paper market maker quoting this Binance.US pair, if any

@@ -148,8 +148,10 @@ python -m mmstack.main run experiments\coinbase-alarm-link.json --dry-run     (l
   2 at a time (`--workers`), at low priority.
 - **Saved replays**: `E:\mmresults\runner\cache`, keyed by diary, day,
   settings and a fingerprint of the bot's code. Reruns only replay new days;
-  any change to replay code redoes everything (`runner.py` and `days.py`
-  don't count: they can't change a replay).
+  any change to replay code (`runner.REPLAY_CODE`: main, eventlog, state,
+  paper_mm, books, venues) redoes everything; editing other files (runner,
+  days, hlwatch, ...) keeps saved replays. A test checks that list against
+  what replay actually imports.
 - **Verdict** per symbol, weekdays and weekends apart: WORKS / DOESN'T WORK
   need 7+ days, better (worse) on at least 6 of 7, and the average gain more
   than 2x its wobble (standard error). Otherwise NOT ENOUGH EVIDENCE, with
@@ -291,7 +293,10 @@ How it works:
   is not applied and Binance.US's isn't modeled (`rate_limit not modeled` in
   the summary). Fees: Binance.US maker is 0%, so read the `fee0.00%` column.
   Binance.US books come every 100 ms at most, so queue tracking is coarser
-  than on Kraken. Needs a log recorded with Binance.US (Nov 18, 2026 on).
+  than on Kraken. Binance.US only sends a book when it changes, so any
+  Binance.US message counts as "feed alive" for a good, unchanged book: a
+  quiet LINK book is no longer pulled as stale after 10 s while BTC traffic
+  shows the connection is fine. Needs a log recorded with Binance.US (Nov 18, 2026 on).
 - **Imbalance alarm** (`--mm-imb-alarm X`). Uses our own venue's book, not
   another exchange. When the book's lean (-1..+1, + = more size waiting to
   buy) tips past +X, buyers are about to lift our ask, so the ask comes off
@@ -367,6 +372,15 @@ stops it. Every 5 s (`--every`): open orders, positions, and the mid prices of
 the coins the account has appeared in. Every 60 s (`--fills-every`): its
 latest fills, logging only new ones. Network errors are logged and polling
 carries on.
+
+**HIP-3 dexes** (e.g. `xyz`, the stock perps): fills from every dex come in
+`userFills`, but orders, positions and mids are per dex. `hlwatch` adds a dex
+as soon as the account shows up in one of its coins (`xyz:...`, usually
+through a fill) and from then on asks it too, merging the answers with coin
+names like `xyz:XYZ100`. `--dex xyz` adds it from the first poll. Each dex
+keeps its own margin account, so `hlreport` shows `account value on xyz`
+separately. Each extra dex adds ~24 request weight per poll (the limit is
+1200 a minute).
 
 `hlreport` then shows, per coin: fills, volume, share as maker, fees per $
 (negative = it earns a rebate), realized PnL, markouts after 1 and 5 minutes

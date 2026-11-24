@@ -119,17 +119,18 @@ def load_experiment(path):
 
 
 # ---------- code fingerprint ----------
-# Files that can't change a replay's output: editing them keeps saved replays.
-NOT_REPLAY_CODE = ("runner.py", "days.py")
+# The files a replay's output depends on. Editing any other file (runner,
+# days, hlwatch, ...) keeps saved replays. tests/test_runner.py checks this
+# list against what these files actually import, so a new one can't be missed.
+REPLAY_CODE = ("main.py", "eventlog.py", "state.py", "paper_mm.py", "books.py", "venues.py")
 
 
 def code_fingerprint(package_dir=PACKAGE_DIR):
-    """Hash of the package's .py files that replay uses (all but NOT_REPLAY_CODE).
-    Line endings are normalised, so the same code checked out on Windows and
-    Linux gives the same fingerprint."""
+    """Hash of the REPLAY_CODE files. Line endings are normalised, so the same
+    code checked out on Windows and Linux gives the same fingerprint."""
     h = hashlib.sha256()
     for name in sorted(os.listdir(package_dir)):
-        if name.endswith(".py") and name not in NOT_REPLAY_CODE:
+        if name in REPLAY_CODE:
             with open(os.path.join(package_dir, name), "rb") as f:
                 h.update(name.encode() + b"\0" + f.read().replace(b"\r\n", b"\n") + b"\0")
     return h.hexdigest()[:16]

@@ -298,6 +298,18 @@ class PaperMarketMaker:
             self._first_look(now, self._book)
 
     # ---------- inputs ----------
+    def on_feed_alive(self, now):
+        """The venue's feed is alive and our book is still right, just unchanged.
+
+        Binance.US only sends a book when it changes, so a quiet LINK book can
+        go 10 s without a message while the connection is busy with other
+        pairs. Without this, the booth would pull its quotes as "stale" on a
+        book that is perfectly current. Only refreshes the age of a good book;
+        it never brings back quotes that were pulled."""
+        if self.book_ok and not self.pulled and self.last_book_t is not None:
+            self.last_book_t = now
+        return []
+
     def on_book(self, now, book, valid):
         """Called after every book update for this symbol (valid = checksum OK)."""
         self._advance(now)

@@ -14,6 +14,13 @@ format, so `hlreport` can describe how that account trades:
     fills      userFills           its latest fills (the API returns at most
                                    2000); only fills not seen before are logged
 
+HIP-3 dexes (e.g. "xyz", the stock perps): userFills already includes their
+fills (coin names like "xyz:XYZ100"), but orders, positions and mids are per
+dex. hlwatch asks for each extra dex too and merges the answers into the same
+events, coin names prefixed "dex:". A dex is added when the account shows up
+in one of its coins (usually through a fill) or with --dex. Each extra dex
+adds about 24 request weight per poll (Hyperliquid allows 1200 a minute).
+
 Read-only, public, no account or key needed. Polling misses anything that
 lives for less than the polling interval: we see the resting pattern, not
 every quote update. Markouts compare the exchange's fill time with mids
@@ -49,6 +56,11 @@ def check_address(address):
     return address.lower()
 
 
+def on_dex(coin, dex):
+    """A coin name as seen from one dex: 'XYZ100' on xyz -> 'xyz:XYZ100'."""
+    return coin if not coin or ":" in coin else f"{dex}:{coin}"
+
+
 def fill_key(fill):
     """A fill's identity: its trade id, plus the order id and time to be safe."""
     return (fill.get("tid"), fill.get("oid"), fill.get("time"))
@@ -57,7 +69,7 @@ def fill_key(fill):
 class Watcher:
     """One polling session. `post` and `writer` are passed in so tests can fake them."""
 
-    def __init__(self, address, writer, post=http_post, fills_every=12):
+    def __init__(self, address, writer, post=http_post, fills_every=12, dexes=()):
         self.address = check_address(address)
         self.writer = writer
         self.post = post
@@ -66,6 +78,20 @@ class Watcher:
         self.seen_fills = set()
         self.coins = set()  # coins this account has appeared in
         self.errors = 0
+        self.dexes = []  # extra HIP-3 dexes polled besides the main one
+        for d in dexes:
+            self._add_dex(d, "asked (--dex)")
+
+    def _add_dex(self, dex, why):
+        if dex and dex not in self.dexes:
+            self.dexes.append(dex)
+            self.writer.write("hlwatch", "dex", {"dex": dex, "why": why})
+
+    def _saw(self, coin):
+        if coin:
+            self.coins.add(coin)
+            if ":" in coin:
+                self._add_dex(coin.split(":", 1)[0], f"seen in {coin}")
 
     def _ask(self, kind, body):
         try:
@@ -79,17 +105,45 @@ class Watcher:
         """One round. Returns a short status string."""
         self.polls += 1
         user = self.address
+        dexes = list(self.dexes)  # this poll's set; a dex found now is asked from the next poll
+
         orders = self._ask("orders", {"type": "frontendOpenOrders", "user": user})
         if orders is not None:
-            self.writer.write("hlwatch", "orders", {"orders": orders})
-            self.coins.update(o.get("coin") for o in orders if o.get("coin"))
+            partial = []
+            for d in dexes:
+                more = self._ask(f"orders {d}", {"type": "frontendOpenOrders", "user": user, "dex": d})
+                if more is None:
+                    partial.append(d)
+                    continue
+                orders = orders + [dict(o, coin=on_dex(o.get("coin"), d)) for o in more]
+            data = {"orders": orders}
+            if partial:
+                data["missing_dexes"] = partial
+            self.writer.write("hlwatch", "orders", data)
+            for o in orders:
+                self._saw(o.get("coin"))
+
         state = self._ask("positions", {"type": "clearinghouseState", "user": user})
         if state is not None:
+            state = dict(state)
+            positions = list(state.get("assetPositions", []))
+            margins = {}
+            for d in dexes:
+                more = self._ask(f"positions {d}", {"type": "clearinghouseState", "user": user, "dex": d})
+                if more is None:
+                    continue
+                for p in more.get("assetPositions", []):
+                    q = dict(p.get("position") or {})
+                    q["coin"] = on_dex(q.get("coin"), d)
+                    positions.append(dict(p, position=q))
+                margins[d] = more.get("marginSummary", {})
+            state["assetPositions"] = positions
+            if margins:
+                state["dex_margin"] = margins  # each HIP-3 dex keeps its own margin account
             self.writer.write("hlwatch", "positions", state)
-            for p in state.get("assetPositions", []):
-                coin = (p.get("position") or {}).get("coin")
-                if coin:
-                    self.coins.add(coin)
+            for p in positions:
+                self._saw((p.get("position") or {}).get("coin"))
+
         new = 0
         if self.polls == 1 or self.polls % self.fills_every == 0:
             fills = self._ask("fills", {"type": "userFills", "user": user})
@@ -97,16 +151,24 @@ class Watcher:
                 fresh = [f for f in fills if fill_key(f) not in self.seen_fills]
                 for f in fresh:
                     self.seen_fills.add(fill_key(f))
-                    if f.get("coin"):
-                        self.coins.add(f["coin"])
+                    self._saw(f.get("coin"))
                 if fresh:
                     self.writer.write("hlwatch", "fills", {"fills": fresh, "returned": len(fills)})
                 new = len(fresh)
+
         mids = self._ask("mids", {"type": "allMids"})
-        if mids is not None and self.coins:
-            self.writer.write("hlwatch", "mids", {c: mids[c] for c in sorted(self.coins) if c in mids})
+        if mids is not None:
+            mids = dict(mids)
+            for d in dexes:
+                more = self._ask(f"mids {d}", {"type": "allMids", "dex": d})
+                if more is not None:
+                    mids.update({on_dex(c, d): px for c, px in more.items()})
+            if self.coins:
+                self.writer.write("hlwatch", "mids", {c: mids[c] for c in sorted(self.coins) if c in mids})
         n_orders = len(orders) if orders is not None else "?"
-        return f"poll {self.polls}: {n_orders} open orders, {new} new fills, {len(self.coins)} coins, {self.errors} errors"
+        extra = f", dexes: {','.join(self.dexes)}" if self.dexes else ""
+        return (f"poll {self.polls}: {n_orders} open orders, {new} new fills, "
+                f"{len(self.coins)} coins{extra}, {self.errors} errors")
 
 
 def run(watcher, every_s, clock=time.monotonic, sleep=time.sleep, should_stop=lambda: False, say=print):
@@ -258,4 +320,16 @@ def report(events, markout_s=(60, 300)):
     if vals:
         lines.append(f"hlreport account value: first ${vals[0]:,.0f}, last ${vals[-1]:,.0f}, "
                      f"change ${vals[-1] - vals[0]:+,.0f}")
+    dex_vals = defaultdict(list)  # HIP-3 dexes keep separate margin accounts
+    for ev in data["positions"]:
+        for dex, margin in (ev["data"].get("dex_margin") or {}).items():
+            v = _f((margin or {}).get("accountValue"))
+            if v is not None:
+                dex_vals[dex].append(v)
+    for dex in sorted(dex_vals):
+        vs = dex_vals[dex]
+        lines.append(f"hlreport account value on {dex}: first ${vs[0]:,.0f}, last ${vs[-1]:,.0f}, "
+                     f"change ${vs[-1] - vs[0]:+,.0f}")
+    for ev in data["dex"]:
+        lines.append(f"hlreport dex {ev['data']['dex']} added: {ev['data']['why']}")
     return lines

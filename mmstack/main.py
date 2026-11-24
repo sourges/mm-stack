@@ -459,10 +459,12 @@ def run_hlwatch(args):
     os.makedirs(args.data_dir, exist_ok=True)
     path = os.path.join(args.data_dir, f"hl-{address[2:10]}-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".jsonl")
     writer = EventWriter(path)
+    dexes = _split(args.dex)
     writer.write("hlwatch", "session", {"address": address, "every_s": args.every,
-                                         "fills_every_s": args.fills_every})
+                                         "fills_every_s": args.fills_every, "dexes": dexes})
     print(f"watching {address}, logging to {path} (Ctrl+C to stop)")
-    watcher = hlwatch.Watcher(address, writer, fills_every=max(1, round(args.fills_every / args.every)))
+    watcher = hlwatch.Watcher(address, writer, fills_every=max(1, round(args.fills_every / args.every)),
+                              dexes=dexes)
     try:
         hlwatch.run(watcher, args.every)
     except KeyboardInterrupt:
@@ -683,6 +685,8 @@ def main(argv=None):
     hw.add_argument("--data-dir", default=os.path.join("data", "hl"), help="where to write the log (default data\\hl)")
     hw.add_argument("--every", type=float, default=5.0, help="seconds between polls (default 5)")
     hw.add_argument("--fills-every", type=float, default=60.0, help="seconds between fill checks (default 60)")
+    hw.add_argument("--dex", default="", help="HIP-3 dexes to poll from the start, e.g. xyz "
+                                              "(others are added when the account shows up in them)")
     hw.set_defaults(func=run_hlwatch)
 
     hr = sub.add_parser("hlreport", help="research: summarize an hlwatch log")

@@ -133,28 +133,56 @@ class TestFingerprint(unittest.TestCase):
     def test_line_endings_dont_matter_but_code_does(self):
         with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
             for d, nl in ((a, b"\n"), (b, b"\r\n")):
-                with open(os.path.join(d, "x.py"), "wb") as f:
+                with open(os.path.join(d, "state.py"), "wb") as f:
                     f.write(b"x = 1" + nl + b"y = 2" + nl)
                 with open(os.path.join(d, "notes.txt"), "wb") as f:
                     f.write(d.encode())  # not code: ignored
             self.assertEqual(runner.code_fingerprint(a), runner.code_fingerprint(b))
-            with open(os.path.join(b, "x.py"), "ab") as f:
+            with open(os.path.join(b, "state.py"), "ab") as f:
                 f.write(b"z = 3\n")
             self.assertNotEqual(runner.code_fingerprint(a), runner.code_fingerprint(b))
 
-    def test_runner_and_day_finder_edits_keep_saved_replays(self):
+    def test_only_replay_code_counts(self):
         with tempfile.TemporaryDirectory() as d:
-            for name in ("state.py", "runner.py", "days.py"):
+            for name in ("state.py", "runner.py", "days.py", "hlwatch.py"):
                 with open(os.path.join(d, name), "w") as f:
                     f.write("x = 1\n")
             before = runner.code_fingerprint(d)
-            for name in ("runner.py", "days.py"):
+            for name in ("runner.py", "days.py", "hlwatch.py"):
                 with open(os.path.join(d, name), "a") as f:
                     f.write("y = 2\n")
             self.assertEqual(runner.code_fingerprint(d), before)
             with open(os.path.join(d, "state.py"), "a") as f:
                 f.write("y = 2\n")
             self.assertNotEqual(runner.code_fingerprint(d), before)
+
+    def test_replay_code_list_covers_every_module_replay_imports(self):
+        """Follow 'from .x import' / 'from . import x' starting at the replay entry
+        points; every package module reached must be in REPLAY_CODE, or a
+        change to it would not redo saved replays."""
+        import re as _re
+        pkg = runner.PACKAGE_DIR
+        start = ["main.py", "state.py", "paper_mm.py", "eventlog.py"]
+        # main.py imports some tools lazily inside other commands; those don't run in replay
+        not_in_replay = {"days.py", "runner.py", "hlwatch.py", "imbalance.py", "leadlag.py",
+                         "net.py", "kraken_auth.py", "kraken_private.py"}
+        seen, todo = set(), list(start)
+        while todo:
+            name = todo.pop()
+            if name in seen or name in not_in_replay or not os.path.exists(os.path.join(pkg, name)):
+                continue
+            seen.add(name)
+            with open(os.path.join(pkg, name), encoding="utf-8") as f:
+                src = f.read()
+            found = _re.findall(r"^\s*from \.(\w+) import", src, _re.M)
+            for group in _re.findall(r"^\s*from \. import ([\w, ]+)", src, _re.M):
+                found += [x.strip().split(" as ")[0].strip() for x in group.split(",")]
+            for mod in found:
+                todo.append(mod + ".py")
+        self.assertEqual(sorted(seen - set(runner.REPLAY_CODE)), [])
+        self.assertIn("books.py", seen)  # it really follows imports
+        for name in runner.REPLAY_CODE:
+            self.assertTrue(os.path.exists(os.path.join(pkg, name)), name)
 
 
 class TestParseSummary(unittest.TestCase):
