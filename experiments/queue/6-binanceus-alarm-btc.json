@@ -1,0 +1,9 @@
+{
+  "question": "On Binance.US (0% maker: PnL before fees is the real PnL), does the Coinbase alarm at 1 bp improve BTC/USD total PnL, and is either booth above $0 on its own?",
+  "base": ["--paper-mm", "BTC/USD", "--mm-venue", "binanceus"],
+  "change": ["--mm-alarm-bps", "1"],
+  "judge": {"number": "pnl_fee0", "better": "higher"},
+  "needs": ["binanceus", "coinbase"],
+  "on_its_own": true,
+  "tuned_on": ["20261114-203102"]
+}

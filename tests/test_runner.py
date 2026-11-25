@@ -113,6 +113,10 @@ class TestExperimentFile(unittest.TestCase):
         self.refused(dict(GOOD, judge={"number": "vibes", "better": "higher"}), "one of")
         self.refused(dict(GOOD, judge={"number": "fills", "better": "more"}), '"higher" or "lower"')
 
+    def test_on_its_own_must_be_true_or_false(self):
+        self.refused(dict(GOOD, on_its_own="yes"), "on_its_own")
+        self.assertTrue(self.load(dict(GOOD, on_its_own=True))["on_its_own"])
+
     def test_needs_and_tuned_on(self):
         self.refused(dict(GOOD, needs=["ftx"]), "needs")
         self.refused(dict(GOOD, needs=[]), "needs")
@@ -407,6 +411,32 @@ class TestJudging(unittest.TestCase):
         self.assertEqual(word, "NOT ENOUGH EVIDENCE")
         self.assertIn("better on 5 of 7, worse on 2", why)
         self.assertIn("2 day(s) hiding", why)
+
+    def test_on_its_own(self):
+        def side_rows(values):
+            return [{"base": {"pnl_fee0": v}, "change": {"pnl_fee0": v}} for v in values]
+        word, why = runner.on_its_own(side_rows([0.10, 0.12, 0.09, 0.11, 0.10, 0.13, -0.01]),
+                                      "change", "pnl_fee0", "higher")
+        self.assertEqual(word, "ABOVE ZERO")
+        self.assertIn("above zero on 6 of 7, below on 1", why)
+        word, _ = runner.on_its_own(side_rows([-0.1] * 7), "base", "pnl_fee0", "higher")
+        self.assertEqual(word, "BELOW ZERO")
+        word, why = runner.on_its_own(side_rows([0.1] * 5), "base", "pnl_fee0", "higher")
+        self.assertEqual(word, "NOT ENOUGH EVIDENCE")
+        self.assertIn("5 days (need 7)", why)
+        word, _ = runner.on_its_own(side_rows([-0.1] * 7), "base", "pnl_fee0", "lower")
+        self.assertEqual(word, "ABOVE ZERO")  # "lower is better" flips the yardstick too
+
+    def test_on_its_own_lines_only_when_asked(self):
+        pairs = [(summary_text(markout=-1.0), summary_text(markout=0.5))]
+        rows, _ = runner.compare(GOOD, self.jobs(pairs))
+        tz = days.new_york()
+        plain = "\n".join(runner.report(dict(GOOD, name="x", needs=["kraken"]), "c", rows, [], tz))
+        self.assertNotIn("on its own", plain)
+        asked = "\n".join(runner.report(dict(GOOD, name="x", needs=["kraken"], on_its_own=True),
+                                         "c", rows, [], tz))
+        self.assertIn("base on its own: NOT ENOUGH EVIDENCE: 1 days (need 7); above zero on 0 of 1, below on 1", asked)
+        self.assertIn("change on its own: NOT ENOUGH EVIDENCE: 1 days (need 7); above zero on 1 of 1", asked)
 
     def test_more_days_keep_the_same_share(self):
         self.assertEqual(runner.verdict([row(1.0)] * 12 + [row(0.8)] * 2)[0], "WORKS")  # 14 of 14

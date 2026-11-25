@@ -16,6 +16,10 @@ result is seen:
 being tested. They're left out of the verdict (rule: tune on some days,
 judge on others).
 
+"on_its_own": true (optional): also judge base and change each against
+zero ("is it profitable by itself?"), not only against each other. For
+0%-fee venues, where total PnL before fees is the real PnL.
+
 For each usable test day (from days.py) it replays base and base+change with
 --from/--to, then judges each symbol, weekdays and weekends separately:
 
@@ -111,6 +115,8 @@ def load_experiment(path):
     bad = [v for v in needs if v not in days_mod.VENUES]
     if bad or not needs:
         raise ExperimentError(f'"needs" must list venues from: {", ".join(days_mod.VENUES)}')
+    if not isinstance(exp.setdefault("on_its_own", False), bool):
+        raise ExperimentError('"on_its_own" must be true or false')
     tuned = exp.setdefault("tuned_on", [])
     if not isinstance(tuned, list) or not all(isinstance(x, str) for x in tuned):
         raise ExperimentError('"tuned_on" must be a list of diary names, e.g. ["20261114-203102"]')
@@ -378,6 +384,19 @@ def verdict(rows):
     return "NOT ENOUGH EVIDENCE", stats
 
 
+def on_its_own(rows, side, number, better):
+    """Is one side's judged number above zero by itself? (At 0% fees, total PnL
+    before fees IS the real PnL, so 'above zero' is the question that matters.)
+    Same rule as the verdict, with zero as the yardstick: 7+ days, above zero
+    on 6 of 7, average more than 2x its wobble."""
+    sign = 1 if better == "higher" else -1
+    as_diffs = [{"diff": sign * r[side][number], "hiding": False} for r in rows]
+    word, why = verdict(as_diffs)
+    word = {"WORKS": "ABOVE ZERO", "DOESN'T WORK": "BELOW ZERO"}.get(word, word)
+    why = why.replace("better on", "above zero on").replace("worse on", "below on")
+    return word, why
+
+
 # ---------- output ----------
 def _fmt(x):
     return "n/a" if x is None else f"{x:g}"
@@ -401,6 +420,10 @@ def report(exp, code, rows, left_out, tz):
             group = [r for r in rows if r["symbol"] == sym and r["day"]["kind"] == kind]
             word, why = verdict(group)
             lines.append(f"{sym:<9} {kind:<8} {word}: {why}")
+            if exp.get("on_its_own") and group:
+                for side in ("base", "change"):
+                    w, y = on_its_own(group, side, number, exp["judge"]["better"])
+                    lines.append(f"{'':<9} {'':<8} {side} on its own: {w}: {y}")
     lines += ["", f"{'day':<34} {'kind':<8} {'symbol':<9} {'hours':>5} {'base':>9} {'change':>9} "
                   f"{'diff':>8} {'fills b/c':>11} {'held_back b/c':>15}  notes"]
     for r in sorted(rows, key=lambda r: (r["symbol"], r["day"]["from_ns"])):
