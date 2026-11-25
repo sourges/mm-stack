@@ -233,6 +233,7 @@ python -m mmstack.main live --paper-mm --data-dir E:\mmdata          (records th
 | `--mm-alarm-bps` | `0` | Coinbase alarm: take one side off after Coinbase jumps this many bps (`0` = off, `2` = suggested) |
 | `--mm-alarm-window-ms` | `100` | ...within this many ms |
 | `--mm-alarm-hold-ms` | `1000` | ...and keep that side off this long |
+| `--mm-alarm-max-hold-ms` | `0` | Escalating hold: an alarm that rings again within 5 s of its last hold ending doubles the hold (1 -> 2 -> 4 s ...), up to this; a calm minute resets it (`0` = off). Each pull + re-place costs ~9 of Kraken's rate points |
 | `--mm-alarm-vol` | `0` | Volatility alarm: ring when Coinbase moves K times its normal move per window (`0` = off). `--mm-alarm-bps` then sets a floor |
 | `--mm-alarm-vol-tau-s` | `600` | ...where "normal" is averaged over about this many seconds |
 | `--mm-venue` | `kraken` | Whose book and trades to quote on: `kraken` or `binanceus` |

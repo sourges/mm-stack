@@ -1,0 +1,8 @@
+{
+  "question": "With the 2 bp Coinbase alarm, does requoting less (only after 1.0x the spread instead of 0.1x) free rate budget and improve LINK/USD total PnL before fees (pnl_fee0, $)?",
+  "base": ["--paper-mm", "LINK/USD", "--mm-alarm-bps", "2"],
+  "change": ["--mm-requote", "1.0"],
+  "judge": {"number": "pnl_fee0", "better": "higher"},
+  "needs": ["kraken", "coinbase"],
+  "tuned_on": ["20261114-203102"]
+}

@@ -341,10 +341,10 @@ def compare(exp, jobs):
 
 
 def at_ceiling(row):
-    """Did this replay's order rate reach Kraken's limit (peak 125/125)? Then
-    requotes and cancels were being held back, and with real orders Kraken
-    would have started refusing them. Shown as a warning; it doesn't change
-    the verdict (the replay already models the held-back requotes)."""
+    """Did this replay use Kraken's whole rate budget (peak 125/125)? The booth
+    then held requotes back itself (that cost is already in the numbers), but
+    it ran with no safety margin: if Kraken's live counter differs at all from
+    our model, real orders would be refused. A warning; the verdict is unchanged."""
     return bool(row.get("peak") is not None and row.get("peak_limit")
                 and row["peak"] >= row["peak_limit"])
 
@@ -393,8 +393,8 @@ def report(exp, code, rows, left_out, tz):
              f"needs:      {', '.join(exp['needs'])}    code: {code}",
              f"rule:       {MIN_DAYS}+ days, better on {round(WIN_SHARE * 7)} of 7, avg gain > "
              f"{WOBBLES}x wobble; a day keeping < {HIDING_SHARE:.0%} of base fills counts as worse",
-             "warning:    'at rate limit' = order rate reached Kraken's ceiling (e.g. 125/125); "
-             "with real orders Kraken would refuse some",
+             "warning:    'at rate limit' = the booth used Kraken's whole rate budget (e.g. 125/125); "
+             "the held-back requotes are in the numbers, but there is no safety margin",
              ""]
     for sym in sorted({r["symbol"] for r in rows}):
         for kind in ("weekday", "weekend"):

@@ -120,6 +120,7 @@ class StateMachine:
                                   alarm_bps=Decimal(str(cfg.get("alarm_bps", "0"))),
                                   alarm_window_ns=int(cfg.get("alarm_window_ms", 100)) * 1_000_000,
                                   alarm_hold_ns=int(cfg.get("alarm_hold_ms", 1000)) * 1_000_000,
+                                  alarm_max_hold_ns=int(cfg.get("alarm_max_hold_ms", 0)) * 1_000_000,
                                   alarm_vol=Decimal(str(cfg.get("alarm_vol", "0"))),
                                   alarm_vol_tau_ns=int(cfg.get("alarm_vol_tau_s", 600)) * 1_000_000_000,
                                   book_depth=BINANCEUS_DEPTH if on_binance else KRAKEN_BOOK_DEPTH,
@@ -599,6 +600,8 @@ class StateMachine:
         bps = Decimal(str(cfg.get("alarm_bps", "0")))
         vol = Decimal(str(cfg.get("alarm_vol", "0")))
         timing = f"/{cfg.get('alarm_window_ms', 100)}ms/{cfg.get('alarm_hold_ms', 1000)}ms"
+        if int(cfg.get("alarm_max_hold_ms", 0)):
+            timing += f"_up_to_{cfg['alarm_max_hold_ms']}ms"
         if vol:
             return (f" alarm={vol}x_normal_move{timing} avg_over={cfg.get('alarm_vol_tau_s', 600)}s"
                     + (f" floor={bps}bps" if bps else ""))

@@ -1,0 +1,7 @@
+{
+  "question": "Does turning OFF inventory skew on LINK/USD (max-inventory cap stays on) improve total PnL before fees (pnl_fee0, $)? If it loses, skew is earning its keep.",
+  "base": ["--paper-mm", "LINK/USD"],
+  "change": ["--mm-no-skew"],
+  "judge": {"number": "pnl_fee0", "better": "higher"},
+  "needs": ["kraken", "coinbase"]
+}

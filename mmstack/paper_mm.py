@@ -79,6 +79,11 @@ REF_UPDATE_NS = 1_000_000_000  # ...and is updated once a second
 REF_STALE_NS = 2_000_000_000  # ignore a reference price older than this
 VOL_WARMUP_NS = 60_000_000_000  # volatility alarm stays silent for its first 60 s of data
 CANCEL_COST_BY_AGE = ((5, 8), (10, 6), (15, 5), (45, 4), (90, 2), (300, 1))  # (age < s, points)
+# escalating alarm hold (--mm-alarm-max-hold-ms): an alarm that rings again
+# within ESCALATE_SOON_NS of its last hold ending doubles the hold; a calm
+# stretch of ESCALATE_CALM_NS resets it to the base hold
+ESCALATE_SOON_NS = 5_000_000_000
+ESCALATE_CALM_NS = 60_000_000_000
 
 
 def cancel_cost(age_ns):
@@ -167,6 +172,7 @@ class PaperMarketMaker:
                  requote=Decimal("0.1"), latency_ns=150_000_000, stale_ns=10_000_000_000,
                  size=None, fills="queue", skew=True, ref_weight=Decimal(0), rate_tier=None,
                  alarm_bps=Decimal(0), alarm_window_ns=100_000_000, alarm_hold_ns=1_000_000_000,
+                 alarm_max_hold_ns=0,
                  alarm_vol=Decimal(0), alarm_vol_tau_ns=600_000_000_000,
                  book_depth=KRAKEN_BOOK_DEPTH, kraken_limits=True,
                  imb_threshold=Decimal(0), imb_hold_ns=1_000_000_000, imb_reading="weighted",
@@ -200,6 +206,11 @@ class PaperMarketMaker:
         self.alarm_on = bool(self.alarm_bps or self.alarm_vol)
         self.alarm_window_ns = alarm_window_ns
         self.alarm_hold_ns = alarm_hold_ns
+        # 0 = every alarm holds alarm_hold_ns. Otherwise an alarm that keeps
+        # ringing holds longer (x2 each time, up to this), so a fast market
+        # can't turn it into a stream of cancel + re-place (9 rate points each)
+        self.alarm_max_hold_ns = max(int(alarm_max_hold_ns), 0)
+        self._esc_level = {"bid": 0, "ask": 0}
 
         self.size = self.fixed_size  # order size; if None, decided once we know prices
         self.tick = None
@@ -233,7 +244,8 @@ class PaperMarketMaker:
         self._ref_hist = deque()  # (time, reference mid) inside the alarm window
         self.alarm_until = {"bid": 0, "ask": 0}  # that side stays off until this time
         self.alarm_off_ns = {"bid": 0, "ask": 0}
-        self.stats.update({"alarms_up": 0, "alarms_down": 0, "alarm_fills": 0})
+        self.stats.update({"alarms_up": 0, "alarms_down": 0, "alarm_fills": 0,
+                           "alarm_escalated": 0, "alarm_longest_hold_ms": 0})
         self.imb_off_ns = {"bid": 0, "ask": 0}
         self._imb_zone = 0  # -1 / 0 / +1: where the last reading sat against the threshold
         self.stats.update({"imb_alarms_up": 0, "imb_alarms_down": 0, "imb_readings": 0,
@@ -445,8 +457,32 @@ class PaperMarketMaker:
         hist.append((now, ref_mid))
         return fired
 
+    def alarm_hold(self, now, side):
+        """How long this alarm keeps its side off. Without escalation always
+        alarm_hold_ns. With it: a NEW alarm within ESCALATE_SOON_NS of the last
+        hold ending goes one step up (x2, capped at alarm_max_hold_ns); after
+        ESCALATE_CALM_NS without one it is back to the base hold. An alarm that
+        rings while its hold is still running keeps the current step."""
+        if not self.alarm_max_hold_ns or self.alarm_max_hold_ns <= self.alarm_hold_ns:
+            return self.alarm_hold_ns
+        old = self.alarm_until[side]
+        level = self._esc_level[side]
+        if old <= now:  # a new alarm: how long since the last hold ended?
+            gap = now - old
+            if old and gap < ESCALATE_SOON_NS:
+                if self.alarm_hold_ns << level < self.alarm_max_hold_ns:
+                    level += 1
+            elif gap >= ESCALATE_CALM_NS:
+                level = 0
+            self._esc_level[side] = level
+            if level:
+                self.stats["alarm_escalated"] += 1
+        return min(self.alarm_hold_ns << level, self.alarm_max_hold_ns)
+
     def _alarm(self, now, side):
-        until = now + self.alarm_hold_ns
+        hold = self.alarm_hold(now, side)
+        self.stats["alarm_longest_hold_ms"] = max(self.stats["alarm_longest_hold_ms"], hold // 1_000_000)
+        until = now + hold
         old = self.alarm_until[side]
         if old <= now:  # a new alarm, not an extension of one still running
             self.stats["alarms_up" if side == "ask" else "alarms_down"] += 1
@@ -828,5 +864,9 @@ class PaperMarketMaker:
                          f"hold={self.alarm_hold_ns // 1_000_000}ms "
                          f"alarms up={self.stats['alarms_up']} down={self.stats['alarms_down']} "
                          f"bid_off={off['bid']:.2f}% ask_off={off['ask']:.2f}% "
-                         f"fills_during_alarm={self.stats['alarm_fills']}")
+                         f"fills_during_alarm={self.stats['alarm_fills']}"
+                         + (f" escalate_to={self.alarm_max_hold_ns // 1_000_000}ms "
+                            f"escalated={self.stats['alarm_escalated']} "
+                            f"longest_hold={self.stats['alarm_longest_hold_ms']}ms"
+                            if self.alarm_max_hold_ns > self.alarm_hold_ns else ""))
         return lines

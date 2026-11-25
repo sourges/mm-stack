@@ -378,6 +378,8 @@ def paper_config(args):
             "alarm_hold_ms": args.mm_alarm_hold_ms,
             "alarm_vol": args.mm_alarm_vol,
             "alarm_vol_tau_s": args.mm_alarm_vol_tau_s}
+    if args.mm_alarm_max_hold_ms:
+        cfg["alarm_max_hold_ms"] = args.mm_alarm_max_hold_ms  # only written when used
     if args.mm_venue != "kraken":
         cfg["venue"] = args.mm_venue  # only written when used, so older settings stay as they were
     if args.mm_ref != "coinbase":
@@ -412,6 +414,9 @@ def add_paper_args(p):
                    help="...within this many ms (default 100)")
     p.add_argument("--mm-alarm-hold-ms", type=int, default=1000,
                    help="...and keep that side off this long (default 1000)")
+    p.add_argument("--mm-alarm-max-hold-ms", type=int, default=0, metavar="MS",
+                   help="escalating hold: an alarm ringing again within 5 s of its last hold "
+                        "doubles the hold, up to MS; a calm minute resets it (0 = off, default)")
     p.add_argument("--mm-alarm-vol", default="0", metavar="K",
                    help="volatility alarm: ring when Coinbase moves K times its normal move "
                         "per window (0 = off, default). --mm-alarm-bps then sets a floor")

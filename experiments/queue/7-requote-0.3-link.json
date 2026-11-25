@@ -1,0 +1,7 @@
+{
+  "question": "Does re-quoting LINK/USD less often (only when the wanted price moves 0.3x the distance instead of 0.1x, so quotes keep their queue spot longer) improve total PnL before fees (pnl_fee0, $)?",
+  "base": ["--paper-mm", "LINK/USD"],
+  "change": ["--mm-requote", "0.3"],
+  "judge": {"number": "pnl_fee0", "better": "higher"},
+  "needs": ["kraken", "coinbase"]
+}

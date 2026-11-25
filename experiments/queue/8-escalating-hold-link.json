@@ -1,0 +1,8 @@
+{
+  "question": "Does an escalating alarm hold (x2 when the alarm rings again within 5 s, up to 8 s; reset after a calm minute) improve LINK/USD total PnL before fees (pnl_fee0, $) over the fixed 1 s hold?",
+  "base": ["--paper-mm", "LINK/USD", "--mm-alarm-bps", "2"],
+  "change": ["--mm-alarm-max-hold-ms", "8000"],
+  "judge": {"number": "pnl_fee0", "better": "higher"},
+  "needs": ["kraken", "coinbase"],
+  "tuned_on": ["20261114-203102"]
+}
