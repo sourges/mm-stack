@@ -25,6 +25,9 @@ Order (as of Nov 25; move one per evening, top first):
 7. `5-spread-0.10-link`: quote LINK twice as wide. Shelved on one log.
 8. `6-binanceus-venue-btc`: the same BTC booth on Binance.US instead of
    Kraken (needs Binance.US data, recorded since Nov 18).
+9. `9-rate-margin-15-link`: with the alarm, new orders stop at 110 of
+   Kraken's 125 rate points (a safety margin for real trading). Measures what
+   the margin costs; we need one before real money whatever it shows.
 
 `tuned_on` leaves out Sat 11-14 (20261114-203102) wherever a setting in the
 file was picked on that diary.

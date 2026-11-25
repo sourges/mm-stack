@@ -380,6 +380,13 @@ def paper_config(args):
             "alarm_vol_tau_s": args.mm_alarm_vol_tau_s}
     if args.mm_alarm_max_hold_ms:
         cfg["alarm_max_hold_ms"] = args.mm_alarm_max_hold_ms  # only written when used
+    if args.mm_rate_margin:
+        from .paper_mm import RATE_TIERS
+        limit = RATE_TIERS.get(args.mm_rate_tier, (None,))[0]
+        if args.mm_rate_margin < 0 or (limit is not None and args.mm_rate_margin >= limit):
+            sys.exit(f"--mm-rate-margin must be 0 or more and below the {args.mm_rate_tier} "
+                     f"limit ({limit})")
+        cfg["rate_margin"] = args.mm_rate_margin  # only written when used
     if args.mm_venue != "kraken":
         cfg["venue"] = args.mm_venue  # only written when used, so older settings stay as they were
     if args.mm_ref != "coinbase":
@@ -441,6 +448,10 @@ def add_paper_args(p):
                    default="intermediate",
                    help="obey Kraken's order rate limit for this account level "
                         "(default intermediate; none = only measure it)")
+    p.add_argument("--mm-rate-margin", type=int, default=0, metavar="POINTS",
+                   help="safety margin: new orders and re-quotes stop this many points below "
+                        "Kraken's limit (e.g. 15 -> 110 of 125); cancels may still use the full "
+                        "limit (default 0)")
     p.add_argument("--mm-no-skew", action="store_true",
                    help="baseline: no inventory skew (the max-inventory cap stays on)")
 

@@ -1,0 +1,8 @@
+{
+  "question": "What does a 15-point rate safety margin (new orders stop at 110 of Kraken's 125) cost the LINK/USD alarm booth in total PnL before fees (pnl_fee0, $)? Needed before real money either way; this measures the price.",
+  "base": ["--paper-mm", "LINK/USD", "--mm-alarm-bps", "2"],
+  "change": ["--mm-rate-margin", "15"],
+  "judge": {"number": "pnl_fee0", "better": "higher"},
+  "needs": ["kraken", "coinbase"],
+  "tuned_on": ["20261114-203102"]
+}

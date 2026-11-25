@@ -171,6 +171,7 @@ class PaperMarketMaker:
     def __init__(self, symbol, spread=Decimal("0.0005"), max_inv_multiple=5,
                  requote=Decimal("0.1"), latency_ns=150_000_000, stale_ns=10_000_000_000,
                  size=None, fills="queue", skew=True, ref_weight=Decimal(0), rate_tier=None,
+                 rate_margin=Decimal(0),
                  alarm_bps=Decimal(0), alarm_window_ns=100_000_000, alarm_hold_ns=1_000_000_000,
                  alarm_max_hold_ns=0,
                  alarm_vol=Decimal(0), alarm_vol_tau_ns=600_000_000_000,
@@ -192,6 +193,15 @@ class PaperMarketMaker:
         if rate_tier not in (None, "none") and rate_tier not in RATE_TIERS:
             raise ValueError(f"unknown rate tier {rate_tier!r}")
         self.rate_tier = None if rate_tier in (None, "none") else rate_tier
+        # safety margin: new orders and re-quotes treat (threshold - margin) as the
+        # ceiling, in case Kraken's live counter differs a little from this model.
+        # Cancels may still use the full threshold: they only ever reduce risk.
+        self.rate_margin = Decimal(rate_margin)
+        if self.rate_margin < 0:
+            raise ValueError("rate margin can't be negative")
+        if self.rate_tier is not None and self.rate_margin >= RATE_TIERS[self.rate_tier][0]:
+            raise ValueError(f"rate margin {self.rate_margin} leaves no room under the "
+                             f"{self.rate_tier} limit of {RATE_TIERS[self.rate_tier][0]}")
         self.alarm_bps = Decimal(alarm_bps)  # fixed jump size; with alarm_vol it is the floor
         self.alarm_vol = Decimal(alarm_vol)  # jump size in units of Coinbase's normal move
         self.alarm_vol_tau_ns = alarm_vol_tau_ns
@@ -690,7 +700,8 @@ class PaperMarketMaker:
         if self.rate_tier is None:
             return True
         counter = self.rate[self.rate_tier]
-        if counter.level(now) + cost + MAX_CANCEL_COST * orders_after <= counter.threshold:
+        ceiling = counter.threshold - self.rate_margin
+        if counter.level(now) + cost + MAX_CANCEL_COST * orders_after <= ceiling:
             self._held[side] = False
             return True
         if not self._held[side]:  # count each hold-back once, not every time we re-check
@@ -827,7 +838,8 @@ class PaperMarketMaker:
                          f"(order actions={self.stats['places'] + self.stats['cancels']})")
         if self.rate_tier is not None:
             lines.append(f"summary paper {s} rate_limit enforced={self.rate_tier} "
-                         f"held_back={self.stats['held_back']} "
+                         + (f"margin={self.rate_margin} " if self.rate_margin else "")
+                         + f"held_back={self.stats['held_back']} "
                          f"cancel_blocked={self.stats['cancel_blocked']} "
                          f"peak={self.rate[self.rate_tier].peak:.0f}/{self.rate[self.rate_tier].threshold}")
         if self.ref_weight:

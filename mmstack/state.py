@@ -117,6 +117,7 @@ class StateMachine:
                                   skew=cfg.get("skew", True),
                                   ref_weight=Decimal(str(cfg.get("coinbase", "0"))),
                                   rate_tier=None if on_binance else cfg.get("rate_tier", "none"),
+                                  rate_margin=Decimal(str(cfg.get("rate_margin", "0"))),
                                   alarm_bps=Decimal(str(cfg.get("alarm_bps", "0"))),
                                   alarm_window_ns=int(cfg.get("alarm_window_ms", 100)) * 1_000_000,
                                   alarm_hold_ns=int(cfg.get("alarm_hold_ms", 1000)) * 1_000_000,
@@ -630,7 +631,8 @@ class StateMachine:
                          f"coinbase={cfg.get('coinbase', '0')} "
                          + (f"venue=binanceus rate_limit=not_modeled"
                             if self.paper_venue == "binanceus"
-                            else f"rate_limit={cfg.get('rate_tier', 'none')}")
+                            else f"rate_limit={cfg.get('rate_tier', 'none')}"
+                            + (f"_margin_{cfg['rate_margin']}" if cfg.get("rate_margin") else ""))
                          + (f" ref={self.paper_ref}" if self.paper_ref != "coinbase" else "")
                          + self._alarm_setting(cfg)
                          + self._imb_setting(cfg))
