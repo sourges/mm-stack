@@ -22,6 +22,7 @@ import ssl
 import time
 
 from wsproto import ConnectionType, WSConnection
+from wsproto.utilities import RemoteProtocolError
 from wsproto.events import (
     AcceptConnection,
     BytesMessage,
@@ -108,8 +109,10 @@ class WsClient:
                                "path": self.path, "tls": self.use_tls})
         if not self.before_connect(now):
             return
-        self._attempt += 1
-        attempt = self._attempt
+        with self._prep_lock:
+            self._attempt += 1
+            attempt = self._attempt
+            self._prepared = None  # anything left over belongs to an older attempt
         self.state = "resolving"
 
         def work():
@@ -124,6 +127,8 @@ class WsClient:
                 except Exception as e:
                     result = ("dns_error", e)
             with self._prep_lock:
+                if attempt != self._attempt:
+                    return  # a newer attempt has started: this answer is stale
                 self._prepared = (attempt, result)
             self._wake()
         threading.Thread(target=work, daemon=True, name=f"{self.name}-setup").start()
@@ -311,8 +316,14 @@ class WsClient:
         self._send_raw(request)
 
     def _on_plain_bytes(self, now, data):
-        self._ws.receive_data(data)
-        for ev in self._ws.events():
+        try:
+            self._ws.receive_data(data)
+            events = list(self._ws.events())
+        except RemoteProtocolError as e:
+            # e.g. a bad handshake reply: this connection only, never the others
+            self.close(now, f"ws protocol error: {e}")
+            return
+        for ev in events:
             if self.state == "closed":
                 return
             if isinstance(ev, AcceptConnection):
@@ -468,6 +479,24 @@ class Reactor:
         for c in clients:
             c._wake = self._poke  # a finished connect setup wakes the loop
 
+    @staticmethod
+    def _contain(client, now, error):
+        """Backstop: an unexpected error inside one connection closes (and
+        later reconnects) that connection only, logged with the reason."""
+        try:
+            client.close(now, f"unexpected error: {error!r}")
+        except Exception as e2:  # noqa: BLE001 - even closing failed: drop it hard
+            if client.sock is not None:
+                for drop in (lambda: client.selector.unregister(client.sock), client.sock.close):
+                    try:
+                        drop()
+                    except Exception:  # noqa: BLE001
+                        pass
+            client.state = "closed"
+            client.sock = None
+            client._reconnect_at = now + client.reconnect_delay
+            client.log("conn_close", {"reason": f"unexpected error: {error!r}; close failed: {e2!r}"})
+
     def _poke(self):
         try:
             self._wake_w.send(b"x")
@@ -527,10 +556,13 @@ class Reactor:
                 self._drain_actions(now)
                 continue
             client = key.data
-            if mask & selectors.EVENT_READ and client.sock is not None:
-                client.on_readable(now)
-            if mask & selectors.EVENT_WRITE and client.sock is not None:
-                client.on_writable(now)
+            try:
+                if mask & selectors.EVENT_READ and client.sock is not None:
+                    client.on_readable(now)
+                if mask & selectors.EVENT_WRITE and client.sock is not None:
+                    client.on_writable(now)
+            except Exception as e:  # noqa: BLE001 - one connection's bug must not stop the others
+                self._contain(client, now, e)
         self._drain_actions(now)
         self._fire_timer(now)
         return now
@@ -545,7 +577,10 @@ class Reactor:
             while not stop_event.is_set():
                 now = self._poll_once(self.poll_timeout)
                 for c in self.clients:
-                    c.tick(now)
+                    try:
+                        c.tick(now)
+                    except Exception as e:  # noqa: BLE001
+                        self._contain(c, now, e)
         finally:
             self._timer_log = None  # no more ticks while shutting down
             now = self._clock()
