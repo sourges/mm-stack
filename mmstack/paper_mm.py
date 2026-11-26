@@ -25,9 +25,15 @@ Fills, mode "queue" (default):
   - when a quote goes live we note the size already resting at its price:
     the queue AHEAD of us (Moallemi-Yuan 2017)
   - a trade AT our price uses up the queue ahead first; what is left fills us
-  - a trade THROUGH our price fills us completely
-  - size that leaves our level without a trade is a cancel; we assume cancels
-    are spread evenly through the queue. Size added joins behind us.
+  - a trade THROUGH our price fills us for at most that trade's size (our
+    order is paper: had it been on the real book, that taker would have hit it
+    first and stopped). Several prints add up, and nothing is ahead of us any
+    more. (Before 2026-11-26 it filled the whole order: too generous.)
+  - size that leaves our level without a trade is a cancel; by default we
+    assume cancels are spread evenly through the queue (--mm-cancel-share:
+    even / ahead / behind). Size added joins behind us.
+  - the side that adds inventory is only quoted if a full fill of it, plus
+    whatever may still fill on that side, stays within the max (hard limit).
   - Kraken's book and trade feeds arrive in either order, a fraction of a
     millisecond apart, so the two are matched to avoid counting the same
     size twice.

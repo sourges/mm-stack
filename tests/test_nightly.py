@@ -209,9 +209,11 @@ class TestShippedFiles(unittest.TestCase):
             self.assertIn("python -m mmstack.main nightly", f.read())
 
     def test_binance_alarm_experiment(self):
+        # parked 2026-11-26 (Binance's 100 ms snapshots make it unfair); kept loadable
         from mmstack import runner
         root = os.path.dirname(os.path.dirname(os.path.abspath(m.__file__)))
-        exp = runner.load_experiment(os.path.join(root, "experiments", "binance-vs-coinbase-alarm-link.json"))
+        exp = runner.load_experiment(os.path.join(root, "experiments", "parked",
+                                                  "binance-vs-coinbase-alarm-link.json"))
         self.assertEqual(exp["change"], ["--mm-ref", "binance"])
         self.assertIn("binance", exp["needs"])
 
