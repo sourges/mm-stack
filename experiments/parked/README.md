@@ -12,3 +12,10 @@ Not in the queue and not run at night. Each one waits for something first.
   summary (worst inventory held, average inventory, worst intraday PnL drop),
   added together with another replay-code change; then rerun with the alarm
   in the base and a risk-based judge.
+- `binance-vs-coinbase-alarm-link.json` (parked Nov 26): not a fair test yet.
+  The Binance.com reference price comes from the `depth20@100ms` stream (one
+  snapshot every 100 ms), while the alarm looks for a 2 bp jump within 100 ms
+  and Coinbase's feed is real time. So the Binance alarm can hardly see a
+  jump (Binance-alarm days kept MORE fills, e.g. 220 -> 308). Waits for: the
+  reference price taken from Binance's `bookTicker` stream (every change,
+  already recorded), in the next replay-code batch; then rerun.

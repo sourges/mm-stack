@@ -45,7 +45,7 @@ summary paper LINK/USD rate_limit enforced=intermediate held_back=18599 cancel_b
 """
 
 GOOD = {"question": "q?", "base": ["--paper-mm"], "change": ["--mm-alarm-bps", "2"],
-        "judge": {"number": "markout_1s", "better": "higher"}}
+        "judge": {"number": "markout_1s", "better": "higher"}, "tuned_on": []}
 
 
 def write_exp(folder, exp, name="exp.json"):
@@ -122,6 +122,11 @@ class TestExperimentFile(unittest.TestCase):
         self.refused(dict(GOOD, needs=[]), "needs")
         self.refused(dict(GOOD, tuned_on="20261114-203102"), "tuned_on")
 
+    def test_tuned_on_must_be_written(self):
+        """Required (2026-11-26 review): say which days picked the setting,
+        or [] for none, so tuning days can't slip into the judging by accident."""
+        self.refused({k: v for k, v in GOOD.items() if k != "tuned_on"}, 'missing "tuned_on"')
+
     def test_not_json(self):
         path = os.path.join(self.dir.name, "bad.json")
         with open(path, "w") as f:
@@ -133,8 +138,9 @@ class TestExperimentFile(unittest.TestCase):
     def test_every_experiment_file_loads(self):
         root = os.path.join(runner.REPO_DIR, "experiments")
         paths = [os.path.join(root, n) for n in os.listdir(root) if n.endswith(".json")]
-        paths += [os.path.join(root, "queue", n) for n in os.listdir(os.path.join(root, "queue"))
-                  if n.endswith(".json")]
+        for sub in ("queue", "parked"):
+            paths += [os.path.join(root, sub, n) for n in os.listdir(os.path.join(root, sub))
+                      if n.endswith(".json")]
         self.assertGreaterEqual(len(paths), 8)
         for path in paths:
             exp = runner.load_experiment(path)
@@ -237,6 +243,13 @@ class TestParseSummary(unittest.TestCase):
         r = runner.parse_summary(starter)["symbols"]["BTC/USD"]
         self.assertEqual(r["peak_limit"], 60)  # the limit comes from the line, not a fixed 125
         self.assertTrue(runner.at_ceiling(r))
+
+    def test_risk_numbers(self):
+        text = summary_text(extra="summary paper BTC/USD risk worst_inventory=0.0004 of_max=80.0% "
+                                  "avg_inventory=0.00012\n")
+        r = runner.parse_summary(text)["symbols"]["BTC/USD"]
+        self.assertEqual((r["worst_inventory"], r["avg_inventory"]), (0.0004, 0.00012))
+        self.assertIn("worst_inventory", runner.COLUMNS)
 
     def test_without_rate_limit(self):
         r = runner.parse_summary("summary paper LINK/USD rate_limit not modeled (order actions=5)\n"
@@ -498,9 +511,11 @@ class TestReplayHelpers(unittest.TestCase):
                        t=ev["t"] + 1) for ev in evs]
         with tempfile.TemporaryDirectory() as d:
             mixed, plain = os.path.join(d, "mixed.jsonl"), os.path.join(d, "plain.jsonl")
-            write_log(mixed, sorted(evs + noise, key=lambda e: e["t"]))
+            both = [dict(e, seq=i + 1) for i, e in enumerate(sorted(evs + noise, key=lambda e: e["t"]))]
+            write_log(mixed, both)  # numbered like a real log
             with open(mixed, "ab") as f:  # replay must skip it undecoded, or this line breaks it
-                f.write(b'{"seq":9,"t":%d,"conn":"binance","type":"ws_in","data":{BROKEN\n' % evs[-1]["t"])
+                f.write(b'{"seq":%d,"t":%d,"conn":"binance","type":"ws_in","data":{BROKEN\n'
+                        % (len(both) + 1, evs[-1]["t"]))
             write_log(plain, evs)
             outs = []
             for path, extra in ((mixed, ["--skip-conns", "binance"]), (plain, [])):
@@ -508,7 +523,11 @@ class TestReplayHelpers(unittest.TestCase):
                 with contextlib.redirect_stdout(buf):
                     main(["replay", path, "--paper-mm", "BTC/USD", "--mm-fills", "through",
                           "--summary-only"] + extra)
-                outs.append([x for x in buf.getvalue().splitlines() if "events.ws_in" not in x])
+                lines = buf.getvalue().splitlines()
+                if path == mixed:
+                    self.assertIn("summary data log_gaps=0 missing_lines=0 cut_off_last_line=no", lines)
+                outs.append([x for x in lines if "events.ws_in" not in x
+                             and not x.startswith(("LOG GAP", "summary data"))])
         self.assertEqual(outs[0], outs[1])
         self.assertTrue(any("summary paper BTC/USD fills=30 " in x for x in outs[0]))
 
@@ -559,7 +578,7 @@ class TestEndToEnd(unittest.TestCase):
             "base": ["--paper-mm", "BTC/USD", "--mm-fills", "through", "--mm-latency-ms", "100"],
             "change": ["--mm-spread", "1"],
             "judge": {"number": "fills", "better": "higher"},
-            "needs": ["kraken"]}, "spread-1.json")
+            "needs": ["kraken"], "tuned_on": []}, "spread-1.json")
 
     def tearDown(self):
         self.dir.cleanup()
@@ -605,3 +624,31 @@ class TestEndToEnd(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCsvUpgrade(unittest.TestCase):
+    """New columns must not misalign rows already in results.csv: the file is
+    rewritten once with the new header, old rows matched by column name."""
+
+    def test_old_header_upgraded(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "results.csv")
+            old_fields = [f for f in runner.CSV_FIELDS if f not in ("worst_inventory", "avg_inventory")]
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(old_fields)
+                w.writerow(["old" if c == "run_at" else ("1.5" if c == "pnl_fee0" else "")
+                            for c in old_fields])
+            day = a_day(1)
+            vals = {"pnl_fee0": 0.2, "worst_inventory": 0.0004}
+            rows = [{"day": day, "hours": 24.0, "symbol": "LINK/USD", "base": vals, "change": vals,
+                     "problems": 0, "hiding": False}]
+            runner.append_csv(path, {"name": "x"}, "abc", rows, "new")
+            with open(path, encoding="utf-8", newline="") as f:
+                got = list(csv.DictReader(f))
+            with open(path, encoding="utf-8", newline="") as f:
+                self.assertEqual(next(csv.reader(f)), runner.CSV_FIELDS)
+            self.assertEqual(len(got), 3)
+            self.assertEqual((got[0]["run_at"], got[0]["pnl_fee0"], got[0]["worst_inventory"]),
+                             ("old", "1.5", ""))
+            self.assertEqual((got[1]["run_at"], got[1]["worst_inventory"]), ("new", "0.0004"))

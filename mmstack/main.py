@@ -145,7 +145,7 @@ def action_sink(writer, reactor):
 
 def build_clients(writer, kraken_symbols, coinbase_products, keys=None,
                   private=False, trading_enabled=False, binanceus_symbols=None,
-                  binance_symbols=None):
+                  binance_symbols=None, allowed_symbols=()):
     clients = []
     specs = []
     if kraken_symbols:
@@ -160,7 +160,8 @@ def build_clients(writer, kraken_symbols, coinbase_products, keys=None,
         clients.append(WsClient(s["name"], s["host"], s["port"], s["path"],
                                 s["subscribe"], writer))
     if private:
-        clients.append(KrakenPrivateClient(keys, writer, trading_enabled=trading_enabled))
+        clients.append(KrakenPrivateClient(keys, writer, trading_enabled=trading_enabled,
+                                           allowed_symbols=allowed_symbols))
     return clients
 
 
@@ -199,7 +200,9 @@ def run_live(args):
     clients = build_clients(writer, _split(args.kraken), _split(args.coinbase), keys=keys,
                             private=private, trading_enabled=args.enable_trading,
                             binanceus_symbols=_split(args.binanceus),
-                            binance_symbols=_split(args.binance))
+                            binance_symbols=_split(args.binance),
+                            # the network layer only places orders on the test-order pair
+                            allowed_symbols=(args.test_order,) if args.test_order else ())
     reactor = build_reactor(clients, writer)
     net_stop = threading.Event()
 
@@ -313,8 +316,24 @@ def run_replay(args):
     consume(tailer, sm, out, follow=False)
     for line in sm.summary():
         out.emit(line)
+    for line in integrity_lines(tailer):
+        out.emit(line)
     out.close()
     tailer.close()
+
+
+def integrity_lines(tailer):
+    """Was the log complete? LOG GAP lines (problems: experiments leave the
+    day out) and one 'summary data' line, so damage is never silent."""
+    lines = [f"LOG GAP seq {a} -> {b} ({max(b - a - 1, 0)} lines missing)" for a, b in tailer.seq_gaps]
+    missing = sum(max(b - a - 1, 0) for a, b in tailer.seq_gaps)
+    if tailer.at_end:
+        cut = "yes" if tailer.pending_partial() else "no"
+    else:
+        cut = "not_reached"  # --to stopped the replay before the end of the file
+    lines.append(f"summary data log_gaps={len(tailer.seq_gaps)} missing_lines={missing} "
+                 f"cut_off_last_line={cut}")
+    return lines
 
 
 RECENT_SECONDS = 120  # in folder mode, skip logs changed this recently (probably live)
@@ -360,10 +379,48 @@ def run_compress(args):
         sys.exit(1)
 
 
+# (flag, attribute, rule): "pos" > 0, "nonneg" >= 0, "one" >= 1, "unit" 0..1
+PAPER_CHECKS = [
+    ("--mm-spread", "mm_spread", "pos"), ("--mm-max-inv", "mm_max_inv", "one"),
+    ("--mm-requote", "mm_requote", "nonneg"), ("--mm-latency-ms", "mm_latency_ms", "nonneg"),
+    ("--mm-coinbase", "mm_coinbase", "unit"), ("--mm-alarm-bps", "mm_alarm_bps", "nonneg"),
+    ("--mm-alarm-window-ms", "mm_alarm_window_ms", "one"),
+    ("--mm-alarm-hold-ms", "mm_alarm_hold_ms", "nonneg"),
+    ("--mm-alarm-max-hold-ms", "mm_alarm_max_hold_ms", "nonneg"),
+    ("--mm-alarm-vol", "mm_alarm_vol", "nonneg"),
+    ("--mm-alarm-vol-tau-s", "mm_alarm_vol_tau_s", "one"),
+    ("--mm-imb-alarm", "mm_imb_alarm", "unit"), ("--mm-imb-hold-ms", "mm_imb_hold_ms", "nonneg"),
+    ("--mm-imb-levels", "mm_imb_levels", "one"), ("--mm-imb-bps", "mm_imb_bps", "pos"),
+]
+RULE_TEXT = {"pos": "must be above 0", "nonneg": "must be 0 or more",
+             "one": "must be 1 or more", "unit": "must be from 0 to 1"}
+
+
+def check_paper_settings(args):
+    """Every paper setting in range, or exit listing ALL the bad ones (a bad
+    value used to crash mid-replay, e.g. --mm-max-inv 0)."""
+    bad = []
+    for flag, attr, rule in PAPER_CHECKS:
+        raw = getattr(args, attr)
+        try:
+            v = Decimal(str(raw))
+            if not v.is_finite():
+                raise ArithmeticError
+        except (ArithmeticError, ValueError):
+            bad.append(f"{flag} must be a number (got {raw!r})")
+            continue
+        ok = {"pos": v > 0, "nonneg": v >= 0, "one": v >= 1, "unit": 0 <= v <= 1}[rule]
+        if not ok:
+            bad.append(f"{flag} {RULE_TEXT[rule]} (got {raw})")
+    if bad:
+        sys.exit("bad paper settings:\n  " + "\n  ".join(bad))
+
+
 def paper_config(args):
     """Step 10 paper market maker settings from the command line (or None)."""
     if not getattr(args, "paper_mm", None):
         return None
+    check_paper_settings(args)
     cfg = {"symbols": _split(args.paper_mm),
             "spread": str(Decimal(args.mm_spread) / 100),  # 0.05 (%) -> "0.0005"
             "max_inv": args.mm_max_inv,
@@ -387,6 +444,8 @@ def paper_config(args):
             sys.exit(f"--mm-rate-margin must be 0 or more and below the {args.mm_rate_tier} "
                      f"limit ({limit})")
         cfg["rate_margin"] = args.mm_rate_margin  # only written when used
+    if args.mm_cancel_share != "even":
+        cfg["cancel_share"] = args.mm_cancel_share  # only written when used
     if args.mm_venue != "kraken":
         cfg["venue"] = args.mm_venue  # only written when used, so older settings stay as they were
     if args.mm_ref != "coinbase":
@@ -452,6 +511,9 @@ def add_paper_args(p):
                    help="safety margin: new orders and re-quotes stop this many points below "
                         "Kraken's limit (e.g. 15 -> 110 of 125); cancels may still use the full "
                         "limit (default 0)")
+    p.add_argument("--mm-cancel-share", choices=("even", "ahead", "behind"), default="even",
+                   help="where cancels at our price come from: spread evenly through the queue "
+                        "(even, default), ahead of us (optimistic) or behind us (pessimistic)")
     p.add_argument("--mm-no-skew", action="store_true",
                    help="baseline: no inventory skew (the max-inventory cap stays on)")
 

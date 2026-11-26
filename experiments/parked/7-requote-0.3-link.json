@@ -3,5 +3,6 @@
   "base": ["--paper-mm", "LINK/USD"],
   "change": ["--mm-requote", "0.3"],
   "judge": {"number": "pnl_fee0", "better": "higher"},
-  "needs": ["kraken", "coinbase"]
+  "needs": ["kraken", "coinbase"],
+  "tuned_on": []
 }

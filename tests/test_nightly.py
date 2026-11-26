@@ -139,7 +139,7 @@ class TestNightly(unittest.TestCase):
             "base": ["--paper-mm", "BTC/USD", "--mm-fills", "through"],
             "change": ["--mm-spread", "1"],
             "judge": {"number": "fills", "better": "higher"},
-            "needs": ["kraken"]}, "a-spread.json")
+            "needs": ["kraken"], "tuned_on": []}, "a-spread.json")
         with open(os.path.join(self.exps, "notes.txt"), "w") as f:
             f.write("not an experiment")
 

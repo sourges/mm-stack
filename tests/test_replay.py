@@ -86,7 +86,9 @@ class TestReplay(unittest.TestCase):
             with contextlib.redirect_stdout(devnull):
                 main(["replay", self.path, "--out", out_path])
         with open(out_path, encoding="utf-8") as f:
-            self.assertEqual(f.read().splitlines(), replay_lines(self.path))
+            got = f.read().splitlines()
+        self.assertEqual(got[:-1], replay_lines(self.path))
+        self.assertEqual(got[-1], "summary data log_gaps=0 missing_lines=0 cut_off_last_line=no")
 
 
 

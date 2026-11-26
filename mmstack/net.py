@@ -16,6 +16,7 @@ import errno
 import json
 import queue
 import selectors
+import threading
 import socket
 import ssl
 import time
@@ -52,7 +53,7 @@ class WsClient:
 
     def __init__(self, name, host, port, path, subscribe, log,
                  use_tls=True, ssl_context=None, reconnect_delay=RECONNECT_DELAY,
-                 connect_timeout=CONNECT_TIMEOUT, idle_timeout=IDLE_TIMEOUT):
+                 connect_timeout=CONNECT_TIMEOUT, idle_timeout=IDLE_TIMEOUT, resolver=None):
         self.name = name
         self.host = host
         self.port = port
@@ -79,6 +80,14 @@ class WsClient:
         self._started_at = 0.0
         self._last_data_at = 0.0
         self._reconnect_at = None
+        # slow setup (DNS, REST token) runs on a helper thread; its answer is
+        # picked up by tick() on the loop. _attempt tells a late answer from
+        # an old, already-closed attempt apart from the current one.
+        self._resolver = resolver or socket.getaddrinfo
+        self._attempt = 0
+        self._prepared = None  # (attempt, result) from the helper thread
+        self._prep_lock = threading.Lock()
+        self._wake = lambda: None  # the reactor sets this: wakes its select()
 
     # ---------- logging helper ----------
     def log(self, type_, data=None):
@@ -86,7 +95,9 @@ class WsClient:
 
     # ---------- lifecycle ----------
     def start(self, selector, now):
-        """Begin connecting (DNS lookup is blocking; fine at connect time)."""
+        """Begin connecting. The slow parts (prepare_blocking(), e.g. a REST
+        token, and the DNS lookup) run on a helper thread so they never stall
+        the other connections; tick() carries on when the answer is in."""
         self.selector = selector
         self._reset()
         self._started_at = now
@@ -97,9 +108,46 @@ class WsClient:
                                "path": self.path, "tls": self.use_tls})
         if not self.before_connect(now):
             return
+        self._attempt += 1
+        attempt = self._attempt
+        self.state = "resolving"
+
+        def work():
+            try:
+                extra = self.prepare_blocking()
+            except Exception as e:
+                result = ("prepare_error", e)
+            else:
+                try:
+                    info = self._resolver(self.host, self.port, type=socket.SOCK_STREAM)[0]
+                    result = ("ok", extra, info)
+                except Exception as e:
+                    result = ("dns_error", e)
+            with self._prep_lock:
+                self._prepared = (attempt, result)
+            self._wake()
+        threading.Thread(target=work, daemon=True, name=f"{self.name}-setup").start()
+
+    def _take_prepared(self, now):
+        """On the loop: carry on with a finished setup for the CURRENT attempt."""
+        with self._prep_lock:
+            got, self._prepared = self._prepared, None
+        if got is None:
+            return
+        attempt, result = got
+        if attempt != self._attempt or self.state != "resolving":
+            return  # an old attempt we already gave up on: ignore its answer
+        if result[0] == "prepare_error":
+            self.on_prepare_error(now, result[1])
+            return
+        if result[0] == "dns_error":
+            self.close(now, f"connect setup failed: {result[1]}")
+            return
+        _, extra, info = result
+        if not self.after_prepare(now, extra):
+            return
         try:
-            family, type_, proto, _, addr = socket.getaddrinfo(
-                self.host, self.port, type=socket.SOCK_STREAM)[0]
+            family, type_, proto, _, addr = info
             sock = socket.socket(family, type_, proto)
             sock.setblocking(False)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -113,7 +161,7 @@ class WsClient:
             self.close(now, f"connect failed: {errno.errorcode.get(err, err)}")
             return
         self.state = "connecting"
-        selector.register(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, self)
+        self.selector.register(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, self)
 
     def _reset(self):
         self.sock = None
@@ -151,10 +199,12 @@ class WsClient:
         self._reconnect_at = now + self.reconnect_delay if reconnect else None
 
     def tick(self, now):
-        """Timers: reconnect, connect timeout, idle timeout."""
+        """Timers: reconnect, connect timeout, idle timeout (and a finished setup)."""
+        if self.state == "resolving":
+            self._take_prepared(now)
         if self.state == "closed" and self._reconnect_at is not None and now >= self._reconnect_at:
             self.start(self.selector, now)
-        elif self.state in ("starting", "connecting", "tls", "ws_handshake"):
+        elif self.state in ("starting", "resolving", "connecting", "tls", "ws_handshake"):
             if now - self._started_at > self.connect_timeout:
                 self.close(now, "connect timeout")
         elif self.state == "open":
@@ -320,8 +370,21 @@ class WsClient:
 
     # ---------- hooks for subclasses ----------
     def before_connect(self, now):
-        """Return False to abort this connect attempt (after logging why)."""
+        """Quick checks on the loop. Return False to abort this connect
+        attempt (after logging why). Nothing slow here: see prepare_blocking."""
         return True
+
+    def prepare_blocking(self):
+        """Slow setup work, run on a helper thread (never the loop). Its
+        return value goes to after_prepare(); an exception to on_prepare_error()."""
+        return None
+
+    def after_prepare(self, now, extra):
+        """Back on the loop with prepare_blocking()'s answer. False = abort."""
+        return True
+
+    def on_prepare_error(self, now, error):
+        self.close(now, f"connect setup failed: {error}")
 
     def on_open(self, now):
         for text in self.subscribe:
@@ -402,14 +465,19 @@ class Reactor:
         self._wake_r, self._wake_w = socket.socketpair()
         self._wake_r.setblocking(False)
         self._wake_w.setblocking(False)
+        for c in clients:
+            c._wake = self._poke  # a finished connect setup wakes the loop
 
-    def submit(self, action):
-        """Thread-safe: queue an action for its connection and wake the loop."""
-        self._actions.put(action)
+    def _poke(self):
         try:
             self._wake_w.send(b"x")
         except (BlockingIOError, OSError):
             pass  # already has a wake byte pending, or shutting down
+
+    def submit(self, action):
+        """Thread-safe: queue an action for its connection and wake the loop."""
+        self._actions.put(action)
+        self._poke()
 
     def _drain_actions(self, now):
         try:

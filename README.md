@@ -142,7 +142,11 @@ python -m mmstack.main run experiments\coinbase-alarm-link.json --dry-run     (l
 - `needs`: venues a day must have (default kraken, coinbase). Venues not
   needed are skipped in the replay (`--skip-conns`): their lines are dropped
   before they're decoded.
-- `tuned_on`: diaries used to pick the setting; their days don't count.
+- `tuned_on` (required): diaries used to pick the setting, or `[]` if none
+  were; their days don't count. Required so it's always a decision.
+- A day whose replay shows a `LOG GAP` (lines missing from the recording) is
+  left out, like an `ACTION MISMATCH`. Every replay ends with
+  `summary data log_gaps=.. missing_lines=.. cut_off_last_line=..`.
 - Days come from `days` (16 h+, no gap in a needed venue). Each day is
   replayed twice (base, base + change) with `--from/--to --summary-only`,
   2 at a time (`--workers`), at low priority.
@@ -244,6 +248,11 @@ python -m mmstack.main live --paper-mm --data-dir E:\mmdata          (records th
 | `--mm-imb-levels` / `--mm-imb-bps` | `10` / `5` | ...levels for weighted, window for depth |
 | `--mm-ref` | `coinbase` | Whose price the fair-price signal and the alarms watch: `coinbase` or `binance` (BTCUSDT for BTC/USD) |
 | `--mm-rate-tier` | `intermediate` | obey Kraken's order rate limit for this account level (`starter`, `intermediate`, `pro`); `none` = only measure it |
+| `--mm-cancel-share` | `even` | Where cancels at our price come from: `even` (spread through the queue), `ahead` (optimistic: we move up) or `behind` (pessimistic). Run a test both ways to see if a result depends on this guess |
+
+Bad values (a 0 max inventory, a negative spread, a 0 ms alarm window, ...)
+are refused at the start with a list of every problem, instead of crashing
+mid-replay.
 
 How it works:
 - **Quotes** at the spread each side of mid, rounded away from mid to Kraken's tick.
@@ -251,15 +260,27 @@ How it works:
 - **Skew (the guide's formula)**, x = |inventory| / max: the side that adds
   inventory moves out by `spread * x / (1 - x)`, the side that reduces it moves
   in by `spread * x`. At the max, the adding side isn't quoted.
+- **Hard inventory limit.** The side that adds inventory is only quoted if a
+  full fill of it, plus whatever is still resting or being cancelled on that
+  side, stays within the max. Otherwise the old order is cancelled first and
+  the side re-placed only once there's room. The summary's `risk` line shows
+  `worst_inventory` (and how much of the max it reached) and the
+  time-weighted `avg_inventory`.
 - **Order timing.** A new quote is live only after the latency. A quote we
   decide to move or pull **stays live for the latency** and can still be
   filled (a "stale" fill). One change in flight per side at a time.
 - **Fills, `queue` rule.** When a quote goes live we note the size already
   resting at its price: the queue ahead of us.
   - A trade *at* our price uses up the queue ahead first; the rest fills us.
-  - A trade *through* our price fills us completely.
-  - Size that leaves our level without a trade is a cancel, assumed spread
-    evenly through the queue. Size added joins behind us.
+  - A trade *through* our price fills us for **at most that trade's size**
+    (our order is paper: had it been on the real book, that taker would have
+    hit it first and stopped). Several prints add up. It also means the real
+    level at our price is empty, so nothing is ahead of us any more.
+    (Before 2026-11-26 a through trade filled the whole order, whatever its
+    size: that overstated fills.)
+  - Size that leaves our level without a trade is a cancel, by default
+    assumed spread evenly through the queue (`--mm-cancel-share`). Size added
+    joins behind us.
   - We only record the top 10 levels. If our price is outside them, the queue
     is unknown: no at-price fills, and when the level comes into view we
     assume all of it is ahead of us. `queue_visible` in the summary says how
@@ -471,10 +492,17 @@ no `actions.mismatch`, and `test_order=done`.
   refuses (`action ... rejected: trading disabled`).
 - At most **1 order per session**.
 - Post-only limit orders only.
-- Only **our own** orders are ever cancelled (by `cl_ord_id`, which starts
-  with `mm`). No `cancel_all` and no dead man's switch: both act on the whole
+- Every order is checked by the network layer itself: side `buy`/`sell`, size
+  and price above 0, and a symbol allowed this session (only the
+  `--test-order` pair). Anything else is refused and never sent.
+- Only **our own** orders are ever cancelled: the network layer refuses a
+  cancel for any `cl_ord_id` this session didn't place (ours start with `mm`). No `cancel_all` and no dead man's switch: both act on the whole
   Kraken account and would cancel the spread bot's orders too.
 - On Ctrl+C every order this session placed gets a cancel.
+- A test order that partly fills gets the rest cancelled at once; the test
+  only finishes when Kraken confirms, and reports how much filled.
+- Slow connect setup (DNS, the REST token for the private feed) runs on a
+  helper thread, so it never stalls the market-data connections.
 - API key, signature and WebSocket token never go in the log (`<redacted>`).
 
 ## What the output means

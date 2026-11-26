@@ -306,6 +306,31 @@ class TestQuietBookIsNotStale(unittest.TestCase):
         self.assertFalse(self.mm.book_ok)
         self.assertEqual(self.mm.last_book_t, self.t0)
 
+    def test_other_pairs_keep_it_alive_for_60s_at_most(self):
+        """If only LINK's feed froze while BTC kept talking, BTC's messages
+        must not keep an old LINK book 'current' forever (2026-11-26 review):
+        after 60 s with no LINK message of its own, the normal 10 s stale
+        rule takes over."""
+        self.link_book(0)
+        for s in range(1, 80):
+            self.bn(s, depth("BTCUSD", 100 + s, *BOOK))
+            if s == 65:
+                self.at(65, "main", "timer")
+                self.assertFalse(self.mm.pulled)  # 60 s of help, then 10 s of normal staleness
+        self.at(80, "main", "timer")
+        self.assertTrue(self.mm.pulled)
+        self.assertEqual(self.mm.last_book_t, self.t0 + 60 * self.SEC)
+
+    def test_its_own_message_restarts_the_60s(self):
+        self.link_book(0)
+        for s in range(1, 106):
+            if s == 50:
+                self.link_book(50)
+            else:
+                self.bn(s, depth("BTCUSD", 100 + s, *BOOK))
+        self.at(106, "main", "timer")
+        self.assertFalse(self.mm.pulled)  # own book at 50: helped until 110
+
     def test_only_when_quoting_on_binanceus(self):
         sm = StateMachine(paper_mm={"symbols": ["LINK/USD"], "spread": "0.0005"})  # Kraken booth
         mm = sm.paper["LINK/USD"]

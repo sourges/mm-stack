@@ -161,6 +161,35 @@ class TestTestOrderLifecycle(unittest.TestCase):
         self.assertIn("TEST ORDER WARNING", lines[-1])
         self.assertEqual(s.sm.stats["kraken_priv.fills"], 1)
 
+    def test_partial_fill_cancels_the_rest_then_reconciles(self):
+        """2026-11-26 review: a partly filled order still has a rest resting on
+        Kraken. Cancel it at once, wait for Kraken's word, report what filled."""
+        s = self.placed()
+        s.priv(executions("update", [{"cl_ord_id": self.cl, "exec_type": "new", "order_status": "new"}]))
+        lines, a = s.priv(executions("update", [{"cl_ord_id": self.cl, "exec_type": "trade",
+                                                 "order_status": "partially_filled", "cum_qty": 0.00002}]))
+        self.assertEqual(a, [{"id": 2, "action": "cancel", "conn": "kraken_priv", "cl_ord_id": self.cl}])
+        self.assertIn("TEST ORDER WARNING: partly filled (0.00002) - cancelling the rest", lines[-1])
+        self.assertEqual(s.sm.test_phase, "cancelling")  # not done until Kraken confirms
+        lines, _ = s.priv(executions("update", [{"cl_ord_id": self.cl, "exec_type": "canceled",
+                                                 "order_status": "canceled", "cum_qty": 0.00002}]))
+        self.assertIn("TEST ORDER DONE: partly filled (0.00002), rest cancelled - check your Kraken balance",
+                      lines[-1])
+        self.assertEqual(s.sm.test_phase, "done")
+        self.assertEqual([x["action"] for x in s.actions], ["place", "cancel"])  # one cancel only
+
+    def test_partial_fill_while_cancelling_waits_for_kraken(self):
+        s = self.placed()
+        s.priv(executions("update", [{"cl_ord_id": self.cl, "exec_type": "new", "order_status": "new"}]))
+        s.tick(TEST_ORDER_HOLD_NS + SEC)  # our own cancel goes out
+        lines, a = s.priv(executions("update", [{"cl_ord_id": self.cl, "exec_type": "trade",
+                                                 "order_status": "partially_filled", "cum_qty": 0.00001}]))
+        self.assertEqual(a, [])  # the cancel is already on its way
+        self.assertEqual(s.sm.test_phase, "cancelling")
+        lines, _ = s.priv(executions("update", [{"cl_ord_id": self.cl, "exec_type": "canceled",
+                                                 "order_status": "canceled"}]))
+        self.assertIn("TEST ORDER DONE: partly filled (0.00001), rest cancelled", lines[-1])
+
     def test_other_orders_ignored(self):
         s = self.placed()
         lines, _ = s.priv(executions("update", [{"cl_ord_id": "spreadbot-1", "exec_type": "new",

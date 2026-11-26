@@ -84,10 +84,37 @@ class EventTailer:
     CHUNK = 1 << 20  # read 1 MB at a time
     _CONN = b'"conn":"'
 
+    _SEQ = b'{"seq":'
+
     def __init__(self, path, skip_conns=()):
         self._f = open_log(path)
         self._buf = b""
         self._skip = frozenset(c.encode() for c in skip_conns)
+        # our own line numbers: the writer counts +1 per line, so any jump
+        # means lines are missing. Checked on EVERY line, skipped ones too.
+        self._last_seq = None
+        self.seq_gaps = []  # (last seq seen, next seq seen) for each jump
+        self.at_end = False  # True once a read found no more bytes
+
+    def _check_seq(self, line):
+        if line.startswith(self._SEQ):
+            end = line.find(b",", len(self._SEQ), 30)
+            try:
+                seq = int(line[len(self._SEQ):end])
+            except ValueError:
+                seq = None
+        else:
+            seq = None
+        if seq is None:  # unusual line: read it the slow way
+            try:
+                seq = json.loads(line).get("seq")
+            except ValueError:
+                seq = None
+        if not isinstance(seq, int):
+            return
+        if self._last_seq is not None and seq != self._last_seq + 1:
+            self.seq_gaps.append((self._last_seq, seq))
+        self._last_seq = seq
 
     def _skipped(self, line):
         i = line.find(self._CONN, 0, 80)  # always within the first ~60 bytes
@@ -101,11 +128,16 @@ class EventTailer:
         while not events:
             chunk = self._f.read(self.CHUNK)
             if not chunk:
+                self.at_end = True
                 break
+            self.at_end = False
             parts = (self._buf + chunk).split(b"\n")
             self._buf = parts.pop()  # last piece has no newline yet (may be b"")
             for line in parts:
-                if line.strip() and not (self._skip and self._skipped(line)):
+                if not line.strip():
+                    continue
+                self._check_seq(line)
+                if not (self._skip and self._skipped(line)):
                     events.append(json.loads(line))
         return events
 
@@ -155,6 +187,14 @@ class WindowTailer:
 
     def pending_partial(self):
         return self._tailer.pending_partial()
+
+    @property
+    def seq_gaps(self):
+        return self._tailer.seq_gaps
+
+    @property
+    def at_end(self):
+        return self._tailer.at_end and not self.reached_end
 
     def close(self):
         self._tailer.close()

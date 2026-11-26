@@ -130,7 +130,8 @@ class StateMachine:
                                   imb_hold_ns=int(cfg.get("imb_hold_ms", 1000)) * 1_000_000,
                                   imb_reading=cfg.get("imb_reading", "weighted"),
                                   imb_levels=int(cfg.get("imb_levels", 10)),
-                                  imb_bps=Decimal(str(cfg.get("imb_bps", "5"))))
+                                  imb_bps=Decimal(str(cfg.get("imb_bps", "5"))),
+                                  cancel_share=cfg.get("cancel_share", "even"))
             if sym in self.instruments and not on_binance:
                 mm.set_instrument(self.instruments[sym])
             self.paper[sym] = mm
@@ -524,6 +525,10 @@ class StateMachine:
             order = self.orders[cl]
             exec_type = d.get("exec_type")
             order["status"] = d.get("order_status", order["status"])
+            if d.get("cum_qty") is not None:
+                order["filled"] = Decimal(str(d["cum_qty"]))  # total filled so far (Kraken's count)
+            if order["status"] == "partially_filled":
+                order["partial"] = True
             out.append(self._line(f"order {cl} {exec_type} status={order['status']}"
                                   + (f" reason={d.get('reason')}" if d.get("reason") else "")))
             if exec_type == "new":
@@ -533,6 +538,11 @@ class StateMachine:
 
     # ---------- step 5: one test order ----------
     _test_action_id = None
+
+    @staticmethod
+    def _filled(order):
+        f = order.get("filled")
+        return "unknown amount" if f is None else format(f.normalize(), "f")
 
     def _test_order_step(self, out):
         phase = self.test_phase
@@ -569,7 +579,16 @@ class StateMachine:
             if order["status"] in ("canceled", "expired"):
                 self.test_phase = "done"
                 out.append(self._line("TEST ORDER FAILED: canceled by Kraken before it opened"))
-            elif order["status"] in ("partially_filled", "filled"):
+            elif order["status"] == "partially_filled":
+                # part filled, the rest is still resting on Kraken: cancel it now,
+                # and only finish once Kraken confirms (2026-11-26 review)
+                action = self._act(out, action="cancel", conn="kraken_priv",
+                                   cl_ord_id=self.test_cl_ord_id)
+                self._test_action_id = action["id"]
+                self.test_phase = "cancelling"
+                out.append(self._line(f"TEST ORDER WARNING: partly filled ({self._filled(order)}) "
+                                      f"- cancelling the rest"))
+            elif order["status"] == "filled":
                 self.test_phase = "done"
                 out.append(self._line("TEST ORDER WARNING: it filled - check your Kraken balance"))
             elif order["open_t"] is not None and self.now - order["open_t"] >= TEST_ORDER_HOLD_NS:
@@ -580,10 +599,15 @@ class StateMachine:
         elif phase == "cancelling":
             if order["status"] == "canceled":
                 self.test_phase = "done"
-                out.append(self._line("TEST ORDER COMPLETE: placed, confirmed, cancelled"))
-            elif order["status"] in ("partially_filled", "filled"):
+                if order.get("partial"):
+                    out.append(self._line(f"TEST ORDER DONE: partly filled ({self._filled(order)}), "
+                                          f"rest cancelled - check your Kraken balance"))
+                else:
+                    out.append(self._line("TEST ORDER COMPLETE: placed, confirmed, cancelled"))
+            elif order["status"] == "filled":
                 self.test_phase = "done"
                 out.append(self._line("TEST ORDER WARNING: it filled - check your Kraken balance"))
+            # partially_filled: our cancel is already on its way; wait for Kraken's answer
 
     # ---------- end of run ----------
     @staticmethod
@@ -635,7 +659,9 @@ class StateMachine:
                             + (f"_margin_{cfg['rate_margin']}" if cfg.get("rate_margin") else ""))
                          + (f" ref={self.paper_ref}" if self.paper_ref != "coinbase" else "")
                          + self._alarm_setting(cfg)
-                         + self._imb_setting(cfg))
+                         + self._imb_setting(cfg)
+                         + (f" cancels={cfg['cancel_share']}"
+                            if cfg.get("cancel_share", "even") != "even" else ""))
             for sym in sorted(self.paper):
                 lines.extend(self.paper[sym].summary_lines(total))
         return lines

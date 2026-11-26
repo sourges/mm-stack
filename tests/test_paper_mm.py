@@ -210,9 +210,31 @@ class TestQueue(unittest.TestCase):
         out = self.m.on_trade(T0 + 3 * SEC, "sell", D("99.00"), D("3"))  # long after: a new trade
         self.assertIn("buy 1 @ 99.00 (queue)", out[0])
 
-    def test_trade_through_fills_everything(self):
+    def test_trade_through_fills_at_most_the_trade(self):
+        """Our order is paper, not on the real book: had it been there, a taker
+        selling 0.3 would have hit it for 0.3 and stopped. So a print through
+        our price fills at most its own size (2026-11-26 review)."""
         out = self.m.on_trade(T0 + SEC, "sell", D("98.99"), D("0.3"))
+        self.assertIn("buy 0.3 @ 99.00 (through)", out[0])
+        self.assertEqual(self.m.inventory, D("0.3"))
+
+    def test_trade_through_bigger_than_us_fills_all(self):
+        out = self.m.on_trade(T0 + SEC, "sell", D("98.99"), D("5"))
         self.assertIn("buy 1 @ 99.00 (through)", out[0])
+
+    def test_partial_through_fills_add_up(self):
+        self.m.on_trade(T0 + SEC, "sell", D("98.99"), D("0.3"))
+        out = self.m.on_trade(T0 + SEC + MS, "sell", D("98.98"), D("0.9"))
+        self.assertIn("buy 0.7 @ 99.00 (through", out[0])  # only what was left (now re-quoting: stale)
+        self.assertEqual(self.m.inventory, D(1))
+
+    def test_trade_through_empties_the_queue_ahead(self):
+        """A print below our price means the real level at our price is empty:
+        nothing is ahead of us any more, so the next print at our price reaches us."""
+        self.m.on_trade(T0 + SEC, "sell", D("98.99"), D("0.3"))
+        self.assertEqual(self.q.ahead, D(0))
+        out = self.m.on_trade(T0 + SEC + MS, "sell", D("99.00"), D("0.2"))
+        self.assertIn("buy 0.2 @ 99.00 (queue", out[0])
 
     def test_taker_side_mapping(self):
         # a taker BUY lifts asks: never our bid
@@ -450,3 +472,111 @@ class TestInStateMachine(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestInventoryRoom(unittest.TestCase):
+    """The max inventory is a hard limit: a side that adds inventory is only
+    quoted if a full fill of it, plus anything still resting or being
+    cancelled on that side, stays within the max (2026-11-26 review)."""
+
+    def at_inventory(self, inv):
+        """Long `inv` (size 1, max 2), quotes moved to match and landed."""
+        m = mm()
+        bk = started(m)
+        t = T0 + SEC
+
+        def settle(t):
+            for _ in range(4):  # let re-quotes go out and land
+                m.on_book(t, bk, True)
+                m.on_timer(t + LAT)
+                t += 2 * LAT
+            return t
+        while m.inventory < inv:  # buy in pieces of at most one order (through the bid)
+            m.on_trade(t, "sell", D("90.00"), min(inv - m.inventory, D(1)))
+            t = settle(t + MS)
+        return m, t
+
+    def test_reviewer_case_no_breach(self):
+        # long 1.5 of max 2 with size 1: a full bid fill would make 2.5
+        m, t = self.at_inventory(D("1.5"))
+        self.assertEqual(m.inventory, D("1.5"))
+        m.on_trade(t, "sell", D("90.00"), D("5"))  # a big sell through any bid
+        self.assertLessEqual(m.inventory, m.max_inventory)
+
+    def test_room_for_a_whole_order_still_quotes(self):
+        m, t = self.at_inventory(D("1"))  # 1 + 1 = 2: exactly fits
+        self.assertIsNotNone(m.bid)
+        m.on_trade(t, "sell", D("90.00"), D("5"))
+        self.assertEqual(m.inventory, D(2))
+
+    def test_reducing_side_still_quoted(self):
+        m, _ = self.at_inventory(D("1.5"))
+        self.assertIsNotNone(m.ask)  # selling only reduces a long
+
+    def test_dying_order_counts_as_exposure(self):
+        """A bid being cancelled can still fill during the latency, so a new
+        bid must leave room for both."""
+        m = mm()
+        bk = started(m)
+        m.on_trade(T0 + SEC, "sell", D("98.00"), D("0.5"))  # long 0.5, bid 0.5 left resting
+        t = T0 + 2 * SEC
+        m.on_book(t, bk, True)
+        # the 0.5 remainder is dying (re-quote to full size); exposure if both fill
+        bids = [q for q in (m.cur["bid"], m.nxt["bid"]) if q is not None]
+        self.assertLessEqual(m.inventory + sum(q.size for q in bids), m.max_inventory)
+
+    def test_resting_order_cancelled_when_inventory_leaves_no_room(self):
+        """With skew off the bid price doesn't move when inventory changes, so
+        the old bid would just stay. If its fill could pass the max, it goes."""
+        m = mm(skew=False)
+        bk = started(m)
+        m.on_trade(T0 + SEC, "sell", D("90.00"), D("1"))  # long 1, bid gone (filled)
+        t = T0 + SEC + MS
+        for _ in range(4):
+            m.on_book(t, bk, True)
+            m.on_timer(t + LAT)
+            t += 2 * LAT
+        self.assertIsNotNone(m.bid)  # 1 + 1 fits
+        m.on_trade(t, "sell", D("90.00"), D("0.5"))  # long 1.5, the same bid has 0.5 left
+        m.on_book(t + MS, bk, True)
+        m.on_trade(t + 2 * MS, "sell", D("90.00"), D("5"))
+        self.assertLessEqual(m.inventory, m.max_inventory)
+
+    def test_old_order_and_its_replacement_together_stay_within_max(self):
+        """Long 0.7 with an old bid of 0.7 left: a new full bid (1) fits on its
+        own (1.7), but if the old one fills while its cancel travels AND then
+        the new one fills, that's 2.4 of max 2. So: cancel first, re-place later."""
+        m = mm()
+        bk = started(m)
+        t = T0 + SEC
+        m.on_trade(t, "sell", D("90.00"), D("0.4"))  # long 0.4
+        for _ in range(4):
+            t += 2 * LAT
+            m.on_book(t, bk, True)
+            m.on_timer(t + LAT)
+        t += 2 * LAT
+        self.assertEqual(m.bid.size, D(1))  # a fresh full bid
+        m.on_trade(t, "sell", D("90.00"), D("0.3"))  # long 0.7, 0.7 of the bid left
+        m.on_book(t + MS, bk, True)  # inventory changed: the booth reacts
+        m.on_trade(t + 50 * MS, "sell", D("90.00"), D("5"))  # hits the old bid in flight
+        for i in range(1, 6):
+            m.on_book(t + i * LAT, bk, True)
+            m.on_trade(t + i * LAT + MS, "sell", D("90.00"), D("5"))  # and anything after
+        self.assertLessEqual(m.inventory, m.max_inventory)
+
+    def test_worst_inventory_in_summary(self):
+        m, t = self.at_inventory(D("1.5"))
+        m.on_trade(t, "buy", D("110.00"), D("5"))  # sell through our ask
+        lines = "\n".join(m.summary_lines(10 * SEC))
+        self.assertIn("summary paper TEST risk worst_inventory=1.5 of_max=75.0%", lines)
+
+
+class TestAverageInventory(unittest.TestCase):
+    def test_time_weighted(self):
+        # flat for 1 s, then long 1 for 2 s: average = (0*1 + 1*2) / 3
+        m = mm()
+        started(m)
+        m.on_trade(T0 + SEC, "sell", D("90.00"), D("1"))
+        m.on_timer(T0 + 3 * SEC)
+        line = m.summary_lines(3 * SEC)[-1]
+        self.assertIn("worst_inventory=1 of_max=50.0% avg_inventory=0.66666667", line)

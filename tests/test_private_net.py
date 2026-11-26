@@ -44,6 +44,7 @@ class PrivateTestBase(NetTestBase):
         threading.Thread(target=server_main, daemon=True).start()
         self.client = KrakenPrivateClient(keys, self.writer, trading_enabled=trading_enabled,
                                           max_orders=max_orders, token_getter=token_getter,
+                                          allowed_symbols=("BTC/USD",),
                                           host="localhost", port=port, use_tls=False)
         self.reactor = Reactor([self.client], poll_timeout=0.01)
         self.reactor_thread = threading.Thread(target=self.reactor.run, args=(self.stop,), daemon=True)
@@ -138,6 +139,42 @@ class TestPrivateClient(PrivateTestBase):
         self.assertEqual(last["params"]["cl_ord_id"], [PLACE["cl_ord_id"]])
         self.assertNotIn("cancel_all", json.dumps(self.received))
         self.assertNotIn("cancel_all_orders_after", json.dumps(self.received))
+
+    def rejected(self, action):
+        self.reactor.submit(action)
+        evs = wait_for(self.log_path, lambda e: e["type"] == "action_rejected"
+                       and e["data"]["id"] == action["id"])
+        return [e for e in evs if e["type"] == "action_rejected" and e["data"]["id"] == action["id"]][0]
+
+    def test_bad_orders_refused_by_the_network_layer(self):
+        """2026-11-26 review: the network layer checks every order itself,
+        whatever the strategy sent."""
+        self.start_private(max_orders=10)
+        self.wait_received(1)
+        cases = [(dict(PLACE, id=11, side="short"), "side must be buy or sell"),
+                 (dict(PLACE, id=12, qty="0"), "qty must be above 0"),
+                 (dict(PLACE, id=13, qty="-1"), "qty must be above 0"),
+                 (dict(PLACE, id=14, price="0"), "price must be above 0"),
+                 (dict(PLACE, id=15, price="abc"), "price must be a number"),
+                 (dict(PLACE, id=16, qty="NaN"), "qty must be a number"),
+                 (dict(PLACE, id=17, symbol="ETH/USD"), "symbol ETH/USD not allowed")]
+        for action, words in cases:
+            with self.subTest(action=action["id"]):
+                self.assertIn(words, self.rejected(action)["data"]["reason"])
+        time.sleep(0.2)
+        self.assertEqual([m["method"] for m in self.received], ["subscribe"])  # nothing sent
+        self.assertEqual(self.client.orders_sent, 0)  # refusals don't use up the cap
+
+    def test_cancel_only_our_own_ids(self):
+        """The spread bot shares the account: a cancel for an id this session
+        didn't place is refused, never sent."""
+        self.start_private()
+        self.wait_received(1)
+        rej = self.rejected({"id": 21, "action": "cancel", "conn": "kraken_priv",
+                             "cl_ord_id": "spreadbot-7"})
+        self.assertIn("not an order this session placed", rej["data"]["reason"])
+        time.sleep(0.2)
+        self.assertEqual([m["method"] for m in self.received], ["subscribe"])
 
     def test_no_keys(self):
         self.start_private(keys=None)

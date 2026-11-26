@@ -12,9 +12,10 @@ result is seen:
       "tuned_on": ["20261114-203102"]
     }
 
-"tuned_on" (optional): diaries whose days were used to pick the setting
-being tested. They're left out of the verdict (rule: tune on some days,
-judge on others).
+"tuned_on" (required): diaries whose days were used to pick the setting
+being tested, or [] if none were. They're left out of the verdict (rule:
+tune on some days, judge on others). Required so it is always a decision,
+never forgotten.
 
 "on_its_own": true (optional): also judge base and change each against
 zero ("is it profitable by itself?"), not only against each other. For
@@ -74,11 +75,14 @@ NUMBERS = {
     "breakeven_fee": ("pnl", "breakeven_fee"),
     "spread_earned": ("pnl_split", "spread_earned"),
     "inventory_drift": ("pnl_split", "inventory_drift"),
+    "worst_inventory": ("risk", "worst_inventory"),
+    "avg_inventory": ("risk", "avg_inventory"),
 }
 # what each report/CSV row shows, besides the judged number
 COLUMNS = ["fills", "through", "stale", "markout_1s", "markout_5s", "markout_30s",
            "pnl_fee0", "pnl_fee0.10", "pnl_fee0.40", "breakeven_fee", "spread_earned",
-           "inventory_drift", "quoted_time", "requotes", "held_back", "peak"]
+           "inventory_drift", "quoted_time", "requotes", "held_back", "peak",
+           "worst_inventory", "avg_inventory"]
 
 
 class ExperimentError(ValueError):
@@ -117,7 +121,10 @@ def load_experiment(path):
         raise ExperimentError(f'"needs" must list venues from: {", ".join(days_mod.VENUES)}')
     if not isinstance(exp.setdefault("on_its_own", False), bool):
         raise ExperimentError('"on_its_own" must be true or false')
-    tuned = exp.setdefault("tuned_on", [])
+    if "tuned_on" not in exp:
+        raise ExperimentError('missing "tuned_on": the diaries used to pick this setting, '
+                              'or [] if none were')
+    tuned = exp["tuned_on"]
     if not isinstance(tuned, list) or not all(isinstance(x, str) for x in tuned):
         raise ExperimentError('"tuned_on" must be a list of diary names, e.g. ["20261114-203102"]')
     exp.setdefault("name", os.path.splitext(os.path.basename(path))[0])
@@ -328,6 +335,9 @@ def compare(exp, jobs):
         if any("ACTION MISMATCH" in p for p in problems):
             left_out.append((d, None, "ACTION MISMATCH (replay doesn't match the log)"))
             continue
+        if any(p.startswith("LOG GAP") for p in problems):
+            left_out.append((d, None, "LOG GAP (lines missing from the recording)"))
+            continue
         symbols = sorted(set(res["base"]["symbols"]) & set(res["change"]["symbols"]))
         wanted = exp.get("symbols")
         for sym in symbols:
@@ -455,8 +465,28 @@ CSV_FIELDS = (["run_at", "experiment", "code", "diary", "piece", "from", "to", "
                "side", "symbol"] + COLUMNS + ["problem_lines", "hiding"])
 
 
+def _upgrade_csv(path):
+    """An older results.csv with different columns: rewrite it once with the
+    current header, old rows matched by column name (missing ones blank), so
+    new rows line up and old ones stay comparable."""
+    with open(path, encoding="utf-8", newline="") as f:
+        header = next(csv.reader(f), None)
+    if header is None or header == CSV_FIELDS:
+        return
+    with open(path, encoding="utf-8", newline="") as f:
+        old = list(csv.DictReader(f))
+    tmp = path + ".upgrading"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore", restval="")
+        w.writeheader()
+        w.writerows(old)
+    os.replace(tmp, path)
+
+
 def append_csv(path, exp, code, rows, run_at):
     new = not os.path.exists(path)
+    if not new:
+        _upgrade_csv(path)
     with open(path, "a", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         if new:

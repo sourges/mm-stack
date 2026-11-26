@@ -149,6 +149,14 @@ def level_visible(side, price, depth=KRAKEN_BOOK_DEPTH):
     return price >= worst if side.is_bid else price <= worst
 
 
+# where cancels at our price come from: even (default), ahead (optimistic), behind (pessimistic)
+CANCEL_SHARES = ("even", "ahead", "behind")
+
+# Binance.US: other pairs' messages keep a quiet book current for at most this
+# long after its own last message (then the normal stale rule applies)
+FEED_ALIVE_MAX_NS = 60_000_000_000
+
+
 class PaperQuote:
     def __init__(self, price, size, placed_t, live_at):
         self.price = price
@@ -177,9 +185,26 @@ class PaperMarketMaker:
                  alarm_vol=Decimal(0), alarm_vol_tau_ns=600_000_000_000,
                  book_depth=KRAKEN_BOOK_DEPTH, kraken_limits=True,
                  imb_threshold=Decimal(0), imb_hold_ns=1_000_000_000, imb_reading="weighted",
-                 imb_levels=10, imb_bps=Decimal(5)):
+                 imb_levels=10, imb_bps=Decimal(5), cancel_share="even"):
         if fills not in ("queue", "through"):
             raise ValueError(f"fills must be 'queue' or 'through', not {fills!r}")
+        # second guard (the command line checks first): values that would divide
+        # by zero or make no sense
+        if Decimal(max_inv_multiple) < 1:
+            raise ValueError("max inventory must be at least 1 order size")
+        if Decimal(spread) <= 0:
+            raise ValueError("spread must be above 0")
+        if latency_ns < 0:
+            raise ValueError("latency can't be negative")
+        if alarm_window_ns <= 0:
+            raise ValueError("alarm window must be above 0")
+        if alarm_vol_tau_ns <= 0:
+            raise ValueError("volatility average time must be above 0")
+        if imb_levels < 1:
+            raise ValueError("imbalance levels must be 1 or more")
+        if cancel_share not in CANCEL_SHARES:
+            raise ValueError(f"cancel share must be one of {', '.join(CANCEL_SHARES)}, not {cancel_share!r}")
+        self.cancel_share = cancel_share  # where cancels at our price come from (see _level_dropped)
         self.symbol = symbol
         self.spread = Decimal(spread)
         self.max_inv_multiple = Decimal(max_inv_multiple)
@@ -225,6 +250,11 @@ class PaperMarketMaker:
         self.size = self.fixed_size  # order size; if None, decided once we know prices
         self.tick = None
         self.inventory = Decimal(0)
+        self.worst_inventory = Decimal(0)  # largest |inventory| ever held
+        # time-weighted average |inventory|: inventory only changes on a fill,
+        # so add up |inventory| x time at each fill (not on every event)
+        self._inv_time = Decimal(0)
+        self._inv_since = None  # when the current inventory started (first event)
         self.cash = Decimal(0)
         self.notional = Decimal(0)
         self.spread_earned = Decimal(0)
@@ -233,6 +263,7 @@ class PaperMarketMaker:
         self.last_mid = None
         self._book = None
         self.last_book_t = None
+        self._own_book_t = None
         self.book_ok = False
         self.pulled = True  # quotes off (stale/invalid) at the start
         self.fills = []  # dicts
@@ -250,6 +281,7 @@ class PaperMarketMaker:
         self.ref_gap = None  # slow average of (ref_mid - our mid)
         self._gap_t = None
         self._last_t = None
+        self._first_t = None
         # alarm: a fast jump on the reference exchange takes one side off for a while
         self._ref_hist = deque()  # (time, reference mid) inside the alarm window
         self.alarm_until = {"bid": 0, "ask": 0}  # that side stays off until this time
@@ -300,6 +332,8 @@ class PaperMarketMaker:
         markout due at time T uses the mid that was in effect at T."""
         if self._last_t is not None and any(q and q.is_live(self._last_t) for q in self.cur.values()):
             self.stats["quoted_ns"] += now - self._last_t
+        if self._last_t is None:
+            self._first_t = self._inv_since = now  # the average starts at the first event
         self._last_t = now
         if self.last_mid is not None and self._pending_markouts:
             still = []
@@ -327,8 +361,11 @@ class PaperMarketMaker:
         go 10 s without a message while the connection is busy with other
         pairs. Without this, the booth would pull its quotes as "stale" on a
         book that is perfectly current. Only refreshes the age of a good book;
-        it never brings back quotes that were pulled."""
-        if self.book_ok and not self.pulled and self.last_book_t is not None:
+        it never brings back quotes that were pulled. Other pairs' messages
+        only vouch for FEED_ALIVE_MAX_NS after this pair's own last book: if
+        only this pair's feed froze, its book goes stale after that."""
+        if self.book_ok and not self.pulled and self.last_book_t is not None \
+                and self._own_book_t is not None and now - self._own_book_t <= FEED_ALIVE_MAX_NS:
             self.last_book_t = now
         return []
 
@@ -341,6 +378,7 @@ class PaperMarketMaker:
         self.last_mid = book.mid()
         self._book = book
         self.last_book_t = now
+        self._own_book_t = now  # this pair's own message (on_feed_alive can't set this)
         self._ensure_size(book)
         if self.imb_threshold:
             self._check_imbalance(now, book)  # before quoting, so a pulled side stays off
@@ -374,7 +412,12 @@ class PaperMarketMaker:
             through = q is not None and price > q.price
         if q is not None and q.is_live(now):
             if through:
-                amount = q.size if self.fill_mode == "queue" else min(q.size, qty)
+                # Our order is paper, not on the real book: had it been there,
+                # this taker would have hit it first, for at most the trade's
+                # size. Several prints add up (each fills what is left).
+                amount = min(q.size, qty)
+                if self.fill_mode == "queue":
+                    q.ahead = Decimal(0)  # the real level at our price is empty now
                 out += self._fill(now, our_side, q, amount, "through")
             elif price == q.price and self.fill_mode == "queue" and q.ahead is not None:
                 amount = min(q.size, self._use_queue(now, q, qty))
@@ -622,7 +665,12 @@ class PaperMarketMaker:
         if drop <= 0:
             return
         # `level` is now the size at our price just before the cancels
-        reduction = min(q.ahead, drop * q.ahead / level) if level > 0 else Decimal(0)
+        if self.cancel_share == "ahead":  # optimistic: they were all ahead of us
+            reduction = min(q.ahead, drop)
+        elif self.cancel_share == "behind":  # pessimistic: behind us, unless they don't fit
+            reduction = min(q.ahead, max(Decimal(0), drop - max(Decimal(0), level - q.ahead)))
+        else:  # even: spread through the queue
+            reduction = min(q.ahead, drop * q.ahead / level) if level > 0 else Decimal(0)
         q.ahead -= reduction
         q.debits.append([now, drop, reduction])
 
@@ -727,10 +775,17 @@ class PaperMarketMaker:
         q.dead_at = now + self.latency_ns
         return True
 
+    def _room(self, side, resting):
+        """True if one more full order on this side can't take inventory past
+        the max, even if `resting` (what may still fill there) fills too."""
+        signed = self.inventory if side == "bid" else -self.inventory
+        return signed + resting + self.size <= self.max_inventory
+
     def _move(self, now, side, price, threshold):
         q = self.cur[side]
         if q is None:
-            if price is not None and self._affordable(now, side, ADD_COST, self._open_orders() + 1):
+            if price is not None and self._room(side, Decimal(0)) and \
+                    self._affordable(now, side, ADD_COST, self._open_orders() + 1):
                 self.cur[side] = self._new_quote(now, price)
             return
         if q.dead_at is not None or now < q.live_at:
@@ -740,6 +795,11 @@ class PaperMarketMaker:
             return
         if abs(q.price - price) < threshold and q.size == self.size:
             return  # close enough: keep our place in the queue
+        if not self._room(side, q.size):
+            # replacing it: the old one can still fill while its cancel travels,
+            # and both together could pass the max. Cancel now, place later.
+            self._cancel(now, q)
+            return
         cost = cancel_cost(now - q.placed_t) + ADD_COST
         if not self._affordable(now, side, cost, self._open_orders()):
             return  # can't afford to move it yet: it stays where it is
@@ -767,6 +827,7 @@ class PaperMarketMaker:
         if now < self.alarm_until["bid" if side == "buy" else "ask"]:
             self.stats["alarm_fills"] += 1  # hit before our cancel landed
         quote.size -= qty
+        self._close_inv_span(now)
         value = qty * quote.price
         if side == "buy":
             self.inventory += qty
@@ -779,6 +840,7 @@ class PaperMarketMaker:
             self.stats["sells"] += 1
             self.spread_earned += (quote.price - self.last_mid) * qty
         self.notional += value
+        self.worst_inventory = max(self.worst_inventory, abs(self.inventory))
         self.fills.append({"t": now, "side": side, "price": quote.price, "qty": qty,
                            "kind": kind, "stale": stale})
         i = len(self.fills) - 1
@@ -789,6 +851,11 @@ class PaperMarketMaker:
         tag = kind + (" stale" if stale else "")
         return [f"PAPER FILL {self.symbol} {side} {_qty(qty)} @ {quote.price:f} ({tag}) "
                 f"inv={_qty(self.inventory)} pnl={self.pnl():.4f}"]
+
+    def _close_inv_span(self, now):
+        if self._inv_since is not None:
+            self._inv_time += abs(self.inventory) * (now - self._inv_since)
+        self._inv_since = now
 
     # ---------- results ----------
     def pnl(self, fee=Decimal(0)):
@@ -881,4 +948,14 @@ class PaperMarketMaker:
                             f"escalated={self.stats['alarm_escalated']} "
                             f"longest_hold={self.stats['alarm_longest_hold_ms']}ms"
                             if self.alarm_max_hold_ns > self.alarm_hold_ns else ""))
+        # risk: how much inventory the booth carried (worst and time-weighted average)
+        cap = (self.size or Decimal(0)) * self.max_inv_multiple
+        span = (self._last_t - self._first_t) if self._first_t is not None and self._last_t else 0
+        held = self._inv_time
+        if self._inv_since is not None and self._last_t is not None:
+            held += abs(self.inventory) * (self._last_t - self._inv_since)  # the current stretch
+        avg = held / span if span else Decimal(0)
+        of_max = f"{self.worst_inventory / cap * 100:.1f}%" if cap else "n/a"
+        lines.append(f"summary paper {s} risk worst_inventory={_qty(self.worst_inventory)} "
+                     f"of_max={of_max} avg_inventory={_qty(avg.quantize(Decimal('0.00000001')))}")
         return lines
