@@ -191,11 +191,59 @@ def _f(x):
 
 
 def load(events):
-    """Split a hlwatch log into lists by type."""
-    out = defaultdict(list)
+    """Read a hlwatch log ONCE (any iterable, e.g. a stream from the file) and
+    keep only the small pieces the report needs, not the raw events:
+      polls      [(t, [(coin, (best, levels, $) bid, (best, levels, $) ask)])]
+                 one per orders event (what the quotes section needs, nothing more)
+      mids       {coin: [(t, mid)]}   sorted once, ready for mid_at
+      fills      [fill dict]          (few)
+      positions  [(t, [(coin, signed value)], accountValue, {dex: accountValue})]
+      errors     count;  dex  [(dex, why)]
+    Multi-GB logs then fit in memory and the report needs no re-sorting."""
+    out = {"polls": [], "mids": defaultdict(list), "fills": [], "positions": [],
+           "errors": 0, "dex": []}
     for ev in events:
-        if ev.get("conn") == "hlwatch":
-            out[ev["type"]].append(ev)
+        if ev.get("conn") != "hlwatch":
+            continue
+        kind, t, d = ev["type"], ev["t"], ev["data"]
+        if kind == "orders":
+            per = defaultdict(lambda: {"B": [], "A": []})
+            for o in d["orders"]:
+                per[o.get("coin")][o.get("side")].append((_f(o.get("limitPx")), _f(o.get("sz"))))
+            summary = []  # per coin: (coin, (best, levels, usd) for bid, the same for ask)
+            for coin, sides in per.items():
+                both = []
+                for side in ("B", "A"):
+                    os_ = sides[side]
+                    best = None
+                    if os_:
+                        best = max(px for px, _ in os_) if side == "B" else min(px for px, _ in os_)
+                    both.append((best, len({px for px, _ in os_}), sum(px * sz for px, sz in os_)))
+                summary.append((coin, both[0], both[1]))
+            out["polls"].append((t, summary))
+        elif kind == "mids":
+            for coin, px in d.items():
+                v = _f(px)
+                if v:
+                    out["mids"][coin].append((t, v))
+        elif kind == "fills":
+            out["fills"].extend(d["fills"])
+        elif kind == "positions":
+            held = []
+            for p_ in d.get("assetPositions", []):
+                q = p_.get("position") or {}
+                v, szi = _f(q.get("positionValue")), _f(q.get("szi"))
+                if q.get("coin") and v is not None and szi is not None:
+                    held.append((q["coin"], v if szi >= 0 else -v))
+            acct = _f((d.get("marginSummary") or {}).get("accountValue"))
+            dexes = {dex: _f((m or {}).get("accountValue")) for dex, m in (d.get("dex_margin") or {}).items()}
+            out["positions"].append((t, held, acct, dexes))
+        elif kind == "error":
+            out["errors"] += 1
+        elif kind == "dex":
+            out["dex"].append((d["dex"], d["why"]))
+    for series in out["mids"].values():
+        series.sort()  # once, here (it used to be re-sorted for every poll x coin)
     return out
 
 
@@ -220,24 +268,18 @@ def _median(xs):
 
 
 def report(events, markout_s=(60, 300)):
-    """Text report, as a list of lines."""
+    """Text report, as a list of lines. `events` is read once."""
     data = load(events)
     lines = []
-    polls = data["orders"]
+    polls = data["polls"]
+    mids = data["mids"]
     if polls:
-        span_h = (polls[-1]["t"] - polls[0]["t"]) / 3.6e12
+        span_h = (polls[-1][0] - polls[0][0]) / 3.6e12
         lines.append(f"hlreport {len(polls)} polls over {span_h:.2f} hours, "
-                     f"{len(data['error'])} errors")
-    # mids per coin, by our receive time
-    mids = defaultdict(list)
-    for ev in data["mids"]:
-        for coin, px in ev["data"].items():
-            v = _f(px)
-            if v:
-                mids[coin].append((ev["t"], v))
+                     f"{data['errors']} errors")
 
     # ---- fills ----
-    fills = [f for ev in data["fills"] for f in ev["data"]["fills"]]
+    fills = data["fills"]
     by_coin = defaultdict(list)
     for f in fills:
         by_coin[f.get("coin")].append(f)
@@ -254,7 +296,7 @@ def report(events, markout_s=(60, 300)):
                 f"realized pnl ${pnl:+,.2f} ({pnl / notional * 10000 if notional else 0:+.2f} bps)")
         lines.append(line)
         # markouts: mid later vs fill price, signed so + = good for the account
-        ms = sorted(mids.get(coin, []))
+        ms = mids.get(coin, [])
         if ms:
             parts = []
             for h in markout_s:
@@ -276,19 +318,14 @@ def report(events, markout_s=(60, 300)):
     lines.append("hlreport quotes (median over polls):")
     dist = defaultdict(lambda: {"bid": [], "ask": [], "levels_bid": [], "levels_ask": [],
                                 "usd_bid": [], "usd_ask": []})
-    for ev in polls:
-        per = defaultdict(lambda: {"B": [], "A": []})
-        for o in ev["data"]["orders"]:
-            per[o.get("coin")][o.get("side")].append(o)
-        for coin, sides in per.items():
-            mid = mid_at(sorted(mids.get(coin, [])), ev["t"])
-            for side, key in (("B", "bid"), ("A", "ask")):
-                os_ = sides[side]
-                d = dist[coin]
-                d[f"levels_{key}"].append(len({o.get("limitPx") for o in os_}))
-                d[f"usd_{key}"].append(sum(_f(o["limitPx"]) * _f(o["sz"]) for o in os_))
-                if os_ and mid:
-                    best = max(_f(o["limitPx"]) for o in os_) if side == "B" else min(_f(o["limitPx"]) for o in os_)
+    for t, summary in polls:
+        for coin, bid, ask in summary:
+            mid = mid_at(mids.get(coin, []), t)
+            d = dist[coin]
+            for (best, levels, usd), side, key in ((bid, "B", "bid"), (ask, "A", "ask")):
+                d[f"levels_{key}"].append(levels)
+                d[f"usd_{key}"].append(usd)
+                if best is not None and mid:
                     d[key].append((mid - best) / mid * 10000 if side == "B" else (best - mid) / mid * 10000)
     for coin in sorted(dist, key=lambda c: -(_median(dist[c]["usd_bid"]) or 0) - (_median(dist[c]["usd_ask"]) or 0)):
         d = dist[coin]
@@ -301,13 +338,9 @@ def report(events, markout_s=(60, 300)):
     # ---- positions ----
     lines.append("hlreport positions (by poll):")
     pos = defaultdict(list)
-    for ev in data["positions"]:
-        for p in ev["data"].get("assetPositions", []):
-            q = p.get("position") or {}
-            v = _f(q.get("positionValue"))
-            szi = _f(q.get("szi"))
-            if q.get("coin") and v is not None and szi is not None:
-                pos[q["coin"]].append(v if szi >= 0 else -v)
+    for _, held, _, _ in data["positions"]:
+        for coin, signed in held:
+            pos[coin].append(signed)
     n_polls = max(1, len(data["positions"]))
     for coin in sorted(pos, key=lambda c: -max(abs(x) for x in pos[c])):
         xs = pos[coin]
@@ -315,21 +348,54 @@ def report(events, markout_s=(60, 300)):
         lines.append(f"hlreport   {coin}: held in {len(xs) / n_polls * 100:.0f}% of polls, "
                      f"median |position| ${_median([abs(x) for x in xs]):,.0f}, "
                      f"largest ${max(abs(x) for x in xs):,.0f}, long/short flips {flips}")
-    acct = [ev["data"].get("marginSummary", {}) for ev in data["positions"]]
-    vals = [_f(a.get("accountValue")) for a in acct if _f(a.get("accountValue")) is not None]
+    vals = [acct for _, _, acct, _ in data["positions"] if acct is not None]
     if vals:
         lines.append(f"hlreport account value: first ${vals[0]:,.0f}, last ${vals[-1]:,.0f}, "
                      f"change ${vals[-1] - vals[0]:+,.0f}")
     dex_vals = defaultdict(list)  # HIP-3 dexes keep separate margin accounts
-    for ev in data["positions"]:
-        for dex, margin in (ev["data"].get("dex_margin") or {}).items():
-            v = _f((margin or {}).get("accountValue"))
+    for _, _, _, dexes in data["positions"]:
+        for dex, v in dexes.items():
             if v is not None:
                 dex_vals[dex].append(v)
     for dex in sorted(dex_vals):
         vs = dex_vals[dex]
         lines.append(f"hlreport account value on {dex}: first ${vs[0]:,.0f}, last ${vs[-1]:,.0f}, "
                      f"change ${vs[-1] - vs[0]:+,.0f}")
-    for ev in data["dex"]:
-        lines.append(f"hlreport dex {ev['data']['dex']} added: {ev['data']['why']}")
+    for dex, why in data["dex"]:
+        lines.append(f"hlreport dex {dex} added: {why}")
     return lines
+
+
+def report_file(path):
+    """The report for a log file, read one batch at a time, so a multi-GB log
+    is never all in memory at once."""
+    from .eventlog import EventTailer
+    tailer = EventTailer(path)
+
+    def stream():
+        while True:
+            batch = tailer.read_available()
+            if not batch:
+                return
+            yield from batch
+    try:
+        return report(stream())
+    finally:
+        tailer.close()
+
+
+if __name__ == "__main__":
+    # python -m mmstack.hlwatch report <log> [--out file]   (streams the log; for big files)
+    import argparse
+    ap = argparse.ArgumentParser(prog="python -m mmstack.hlwatch")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    rp = sub.add_parser("report", help="summarize an hlwatch log, reading it as a stream")
+    rp.add_argument("log")
+    rp.add_argument("--out", help="also write the report to this file")
+    a = ap.parse_args()
+    lines = report_file(a.log)
+    for line in lines:
+        print(line)
+    if a.out:
+        with open(a.out, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
