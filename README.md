@@ -416,6 +416,27 @@ few seconds; one address may be only part of an operation (hedges elsewhere
 are invisible); markouts mix the exchange's fill time with our clock, hence
 the minute-long horizons. A busy account can make big logs, so keep them on E:.
 
+## Research: find Hyperliquid's market makers (`hlscan`)
+
+Hyperliquid's public trade feed names both accounts on every trade
+(`users` = [buyer, seller]; `side` B = the buyer took, A = the seller took),
+so the other account was the maker. `hlscan` records that feed for about 40
+markets (a fixed core list of big, middle and smaller perps, the xyz stock
+perps, three spot pairs, plus the perps ranked 20th-40th by 24 h volume at
+start) and ranks the accounts that look like market makers. Judged **per
+coin**: an account can be a taker on one coin and a market maker on another.
+
+```
+scripts\hlscan.bat                                     (24/7 PC: a fresh file every midnight)
+python -m mmstack.hlscan report E:\hldata --out hlscan-report.txt
+```
+
+Likely market maker on a coin: 50+ maker fills, 80%+ of its $ as maker,
+maker buys and sells within 20% of each other, maker fills in 50%+ of the
+hours. Markouts use the last trade price at 1 and 5 minutes (the feed has no
+book), so read averages, not single fills. Fills only: run `hlwatch` on the
+best few to see their resting quotes. About 1 GB a day uncompressed.
+
 ## Research: does the order book's lean predict the next move?
 
 ```
